@@ -111,12 +111,71 @@ async function getGuestCookies() {
   return { jar, status: res.status, got: Object.keys(jar) };
 }
 
+/**
+ * sessionid ke andar hi user id chhupa hota hai: "12345678%3AabcXYZ%3A12%3A..."
+ * Instagram kai endpoints par ds_user_id cookie bhi maangta hai.
+ */
+function dsUserIdFromSession(sid) {
+  if (!sid) return null;
+  const first = decodeURIComponent(String(sid)).split(':')[0];
+  return /^\d+$/.test(first) ? first : null;
+}
+
 function cookieHeader(jar) {
   const all = { ...jar };
-  if (SESSIONID) all.sessionid = SESSIONID;
+  if (SESSIONID) {
+    all.sessionid = SESSIONID;
+    const ds = dsUserIdFromSession(SESSIONID);
+    if (ds) all.ds_user_id = ds;
+  }
   return Object.entries(all)
     .map(([k, v]) => `${k}=${v}`)
     .join('; ');
+}
+
+/**
+ * Instagram ke jawab ko aam bhasha me badalta hai, taki har baar
+ * raw JSON padh kar guess na karna pade.
+ */
+function diagnose(attempts, hasSession) {
+  const blob = JSON.stringify(attempts);
+
+  if (/challenge_required|checkpoint_required/i.test(blob)) {
+    return {
+      code: 'CHALLENGE',
+      meaning: 'Instagram ne account par verification laga di. Ye account ab is server se kaam nahi karega — naya account banana padega.',
+    };
+  }
+  if (/logout_reason|You.{0,3}ve Been Logged Out/i.test(blob) && hasSession) {
+    return {
+      code: 'SESSION_KILLED',
+      meaning: 'sessionid mar chuka hai. Account ban hua ya Instagram ne logout kar diya.',
+    };
+  }
+  if (/login_required|require_login/i.test(blob)) {
+    return hasSession
+      ? {
+          code: 'SESSION_REJECTED',
+          meaning: 'sessionid accept nahi hua — galat copy hua, expire ho gaya, ya IP ki wajah se reject hua.',
+        }
+      : {
+          code: 'NEED_LOGIN',
+          meaning: 'Anonymous access band hai. Vercel me IG_SESSIONID env var set karo.',
+        };
+  }
+  if (/Please wait a few minutes|rate.?limit|Try again later/i.test(blob)) {
+    return {
+      code: 'RATE_LIMITED',
+      meaning: 'Server ka IP flag ho chuka hai. Thodi der baad chal sakta hai, par asli ilaaj residential proxy hai.',
+    };
+  }
+  if (/isAppShell":true/.test(blob)) {
+    return {
+      code: 'APP_SHELL',
+      meaning: 'Instagram ne data ki jagah khaali web page bheja — humein logged-out visitor maan raha hai.',
+    };
+  }
+  return { code: 'UNKNOWN', meaning: 'Pehchana nahi gaya. Poora attempts output bhejo.' };
 }
 
 function webHeaders(jar, extra = {}) {
@@ -255,7 +314,11 @@ async function fromMobileApi(shortcode, jar) {
     'Accept-Language': 'en-US',
     Accept: '*/*',
   };
-  if (SESSIONID) headers.Cookie = `sessionid=${SESSIONID}`;
+  if (SESSIONID) {
+    const ds = dsUserIdFromSession(SESSIONID);
+    headers.Cookie = `sessionid=${SESSIONID}` + (ds ? `; ds_user_id=${ds}` : '');
+    if (ds) headers['X-IG-Android-ID'] = `android-${ds.slice(0, 16)}`;
+  }
 
   const res = await fetch(`https://i.instagram.com/api/v1/media/${mediaId}/info/`, { headers });
   const text = await res.text();
@@ -427,9 +490,12 @@ export default async function handler(req, res) {
     }
   }
 
+  const verdict = diagnose(attempts, Boolean(SESSIONID));
+
   return res.status(502).json({
     error: 'Reel fetch nahi ho paayi',
-    hint: 'Anonymous access band ho sakta hai. sessionid (IG_SESSIONID env var) se try karo.',
+    diagnosis: verdict.code,
+    kya_hua: verdict.meaning,
     shortcode,
     docIdUsed: DOC_ID,
     hadSessionId: Boolean(SESSIONID),
