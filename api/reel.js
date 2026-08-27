@@ -1,5 +1,5 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v3
+//  Instagram Reel Downloader API  —  v5
 //
 //  v2 ka sabak: Instagram bina cookies ke sirf khaali web page deta hai.
 //  Isliye ab pehle guest cookies (csrftoken) leke aate hain, phir data maangte hain.
@@ -9,6 +9,7 @@
 //  Tier 3: Embed page
 //  Tier 4: Web API          (purana, ab shayad hi chale)
 //
+//  CDN cache andar hi hai — WordPress plugin ki zaroorat nahi.
 //  Debug: /api/reel?url=<link>&debug=1
 // ============================================================
 
@@ -77,6 +78,20 @@ function looksLikeHtml(text) {
   return /^\s*<(?:!doctype|html)/i.test(text);
 }
 
+/**
+ * Instagram ka apna error message nikaalta hai.
+ * Ye alag field me isliye rakhte hain kyunki diagnosis ko iski zaroorat
+ * production me bhi hoti hai — jabki raw `sample` sirf debug me jaata hai.
+ */
+function igMessageFrom(text) {
+  try {
+    const j = JSON.parse(text);
+    return j.message || j.error_title || j.errors?.[0]?.message || j.error_type || null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- cookies
 
 /**
@@ -139,6 +154,16 @@ function cookieHeader(jar) {
  */
 function diagnose(attempts, hasSession) {
   const blob = JSON.stringify(attempts);
+
+  // Reel khud hi nahi hai (private/deleted) — ye humari galti nahi hai.
+  // Ise alag pehchanna zaroori hai kyunki iska HTTP status alag hota hai (neeche dekho).
+  if (attempts.some((a) => a.status === 404) && !/login_required|require_login|challenge/i.test(blob)) {
+    return {
+      code: 'REEL_NOT_FOUND',
+      meaning: 'Ye reel private hai, delete ho gayi hai, ya link galat hai.',
+      reelFault: true,
+    };
+  }
 
   if (/challenge_required|checkpoint_required/i.test(blob)) {
     return {
@@ -280,7 +305,7 @@ async function fromGraphQL(shortcode, jar) {
     return { ok: false, reason: `graphql ne HTML bheja (status ${res.status}) — cookies/doc_id kaam nahi kiye`, status: res.status, sample: text.slice(0, 300) };
   }
   if (!res.ok) {
-    return { ok: false, reason: `graphql HTTP ${res.status}`, status: res.status, sample: text.slice(0, 400) };
+    return { ok: false, reason: `graphql HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), sample: text.slice(0, 400) };
   }
 
   let json;
@@ -327,7 +352,7 @@ async function fromMobileApi(shortcode, jar) {
     return { ok: false, reason: `mobile api ne HTML bheja (status ${res.status})`, status: res.status, sample: text.slice(0, 250) };
   }
   if (!res.ok) {
-    return { ok: false, reason: `mobile api HTTP ${res.status}`, status: res.status, sample: text.slice(0, 300) };
+    return { ok: false, reason: `mobile api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), sample: text.slice(0, 300) };
   }
 
   let json;
@@ -430,7 +455,7 @@ async function fromWebApi(shortcode, jar) {
   if (looksLikeHtml(text)) {
     return { ok: false, reason: `web api ne HTML bheja (status ${res.status})`, status: res.status };
   }
-  if (!res.ok) return { ok: false, reason: `web api HTTP ${res.status}`, status: res.status, sample: text.slice(0, 250) };
+  if (!res.ok) return { ok: false, reason: `web api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), sample: text.slice(0, 250) };
 
   let json;
   try { json = JSON.parse(text); }
@@ -444,14 +469,75 @@ async function fromWebApi(shortcode, jar) {
   return { ok: true, data: { source: 'web-api', ...fromRestItem(item, shortcode) } };
 }
 
+// ---------------------------------------------------------------- CDN cache
+//
+// Yahi wo hissa hai jiski wajah se WordPress plugin ki zaroorat nahi.
+// `s-maxage` dekh kar Vercel ka CDN response ko edge par rakh leta hai, aur
+// agli baar wahi reel maangne par FUNCTION CHALTA HI NAHI — request Instagram
+// tak pahunchti hi nahi. Session utna hi kam ghista hai.
+//
+// Cache key poora URL hai (query string ke saath), to har reel ki apni entry hai.
+// Response me `x-vercel-cache: HIT` aaye to samajh lo cache se aaya.
+
+/** Instagram ke CDN link me `oe=<hex>` uski asli expiry hoti hai */
+function secondsUntilExpiry(url) {
+  try {
+    const oe = new URL(url).searchParams.get('oe');
+    if (!oe || !/^[0-9a-f]+$/i.test(oe)) return 0;
+    const left = parseInt(oe, 16) - Math.floor(Date.now() / 1000);
+    return left > 0 ? left : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Cache utni der ke liye jitni der links zinda hain — na ek second zyada.
+ * Sabse pehle marne wala link poore response ki umar tay karta hai.
+ */
+function cacheSeconds(data) {
+  const MAX = 24 * 3600;
+  let shortest = 0;
+
+  for (const m of data.media || []) {
+    const left = secondsUntilExpiry(m.url);
+    if (left > 0 && (shortest === 0 || left < shortest)) shortest = left;
+  }
+
+  if (!shortest) return 3600; // expiry na mile to ek ghanta
+  return Math.max(60, Math.min(MAX, shortest - 600)); // 10 min safety margin
+}
+
+// ---------------------------------------------------------------- CORS
+// '*' rakhoge to koi bhi site aapka API apne tool me laga legi — aapke
+// session par, aapke risk par. Vercel env var ALLOWED_ORIGINS me apni site daalo.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function applyCors(req, res) {
+  if (!ALLOWED_ORIGINS.length) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (ALLOWED_ORIGINS.includes(req.headers.origin)) {
+    res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+    // Origin cache key ka hissa ban jaata hai — isliye ek hi origin rakhna behtar
+    res.setHeader('Vary', 'Origin');
+  } else {
+    // pehla origin default — direct browser visit / server-side calls ke liye
+    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGINS[0]);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+}
+
 // ---------------------------------------------------------------- handler
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   const shortcode = extractShortcode(req.query.url);
   if (!shortcode) {
+    res.setHeader('Cache-Control', 'no-store');
     return res.status(400).json({
       error: 'Valid Instagram reel/post ka link bhejo',
       example: '/api/reel?url=https://www.instagram.com/reel/ABC123xyz/',
@@ -483,8 +569,21 @@ export default async function handler(req, res) {
     try {
       const r = await fn(shortcode, jar);
       const { ok, data, ...diag } = r;
-      attempts.push({ tier: name, ok, ...(debug ? diag : { reason: diag.reason }) });
-      if (ok) return res.status(200).json(debug ? { ...data, cookies: cookieInfo, attempts } : data);
+      // status aur igMessage HAMESHA jaate hain — diagnose() ko production me
+      // bhi inki zaroorat hai. Sirf raw body (`sample`) debug tak seemit hai.
+      const { sample, htmlLength, ...safeDiag } = diag;
+      attempts.push({ tier: name, ok, ...(debug ? diag : safeDiag) });
+      if (ok) {
+        if (debug) {
+          // debug response cache hua to purana diagnostic data chipak jayega
+          res.setHeader('Cache-Control', 'no-store');
+          return res.status(200).json({ ...data, cookies: cookieInfo, attempts });
+        }
+        const ttl = cacheSeconds(data);
+        res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
+        res.setHeader('CDN-Cache-Control', `public, s-maxage=${ttl}`);
+        return res.status(200).json(data);
+      }
     } catch (e) {
       attempts.push({ tier: name, ok: false, reason: `${e.name}: ${e.message}` });
     }
@@ -492,8 +591,25 @@ export default async function handler(req, res) {
 
   const verdict = diagnose(attempts, Boolean(SESSIONID));
 
-  return res.status(502).json({
-    error: 'Reel fetch nahi ho paayi',
+  // Status soch-samajh kar chuna gaya hai, kyunki Vercel sirf
+  // 200/404/410/301/302/307/308 cache karta hai — 502 kabhi cache nahi hota.
+  //
+  //   Reel hi nahi hai   -> 404, 10 min cache. Ek private reel par 500 log click
+  //                         karein to Instagram ko sirf 1 baar poocha jayega.
+  //   Humari taraf dikkat -> 502, koi cache nahi. Session theek karte hi turant
+  //                          sahi chalne lagega, cache clear karne ki zaroorat nahi.
+  const reelFault = Boolean(verdict.reelFault);
+
+  if (debug) {
+    res.setHeader('Cache-Control', 'no-store');
+  } else if (reelFault) {
+    res.setHeader('Cache-Control', 'public, s-maxage=600, max-age=0');
+  } else {
+    res.setHeader('Cache-Control', 'no-store');
+  }
+
+  return res.status( reelFault ? 404 : 502 ).json({
+    error: reelFault ? 'Ye reel fetch nahi ho sakti' : 'Reel fetch nahi ho paayi',
     diagnosis: verdict.code,
     kya_hua: verdict.meaning,
     shortcode,
