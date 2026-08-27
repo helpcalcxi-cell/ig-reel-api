@@ -1,5 +1,5 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v5
+//  Instagram Reel Downloader API  —  v6
 //
 //  v2 ka sabak: Instagram bina cookies ke sirf khaali web page deta hai.
 //  Isliye ab pehle guest cookies (csrftoken) leke aate hain, phir data maangte hain.
@@ -508,6 +508,73 @@ function cacheSeconds(data) {
   return Math.max(60, Math.min(MAX, shortest - 600)); // 10 min safety margin
 }
 
+// ---------------------------------------------------------------- download links
+//
+// Instagram ka CDN `Content-Disposition: attachment` nahi bhejta, isliye video
+// download hone ki jagah browser me khul jaata hai. Cloudflare Worker beech me
+// khada ho kar wo header laga deta hai.
+//
+// Worker ko signed link chahiye, warna wo ek open proxy ban jaata hai jise koi
+// bhi apni bandwidth chalane ke liye use kar lega.
+//
+// ⚠️ SABSE ZAROORI BAAT: signature DETERMINISTIC honi chahiye.
+// Ye poora JSON Vercel ke CDN me 24 ghante cache hota hai. Agar signature
+// `Date.now()` se banti, to pehli request ki signature 24 ghante tak cache me
+// chipak jaati aur ek ghante baad sabke download tootne lagte.
+// Isliye expiry Instagram ke apne `oe=` param se leni hai — wo har baar same
+// rehta hai, aur content ke saath hi natural taur par expire hota hai.
+
+import { createHmac } from 'node:crypto';
+
+const DOWNLOAD_SECRET = process.env.DOWNLOAD_SECRET || '';
+const WORKER_URL = (process.env.WORKER_URL || '').replace(/\/+$/, '');
+
+const DAY = 86400;
+
+/** Signature ki expiry — hamesha wahi value, chahe kitni baar call ho */
+function signExpiry(url) {
+  const own = secondsUntilExpiry(url);
+  if (own > 0) return Math.floor(Date.now() / 1000) + own; // Instagram ki apni expiry
+
+  // `oe=` na mile to din ka bucket — ek pure din tak same value deta hai
+  return (Math.floor(Date.now() / 1000 / DAY) + 2) * DAY;
+}
+
+function safeName(s, fallback) {
+  const clean = String(s || '').replace(/[^A-Za-z0-9._-]/g, '');
+  return clean || fallback;
+}
+
+/**
+ * Har media item par download_url lagata hai.
+ * Worker set na ho to seedha CDN link jaata hai (naye tab me khulega).
+ */
+function addDownloadLinks(data) {
+  const user = safeName(data.username, 'instagram');
+  const code = safeName(data.shortcode, 'media');
+  const total = (data.media || []).length;
+
+  const media = (data.media || []).map((m, i) => {
+    const ext = m.type === 'video' ? 'mp4' : 'jpg';
+    const filename = `${user}_${code}${total > 1 ? `_${i + 1}` : ''}.${ext}`;
+
+    if (!WORKER_URL || !DOWNLOAD_SECRET) {
+      return { ...m, filename, download_url: m.url, forced: false };
+    }
+
+    const exp = signExpiry(m.url);
+    const sig = createHmac('sha256', DOWNLOAD_SECRET).update(`${m.url}|${exp}`).digest('hex');
+
+    const download_url =
+      `${WORKER_URL}/?u=${encodeURIComponent(m.url)}` +
+      `&exp=${exp}&sig=${sig}&name=${encodeURIComponent(filename)}`;
+
+    return { ...m, filename, download_url, forced: true };
+  });
+
+  return { ...data, media, forced_download: Boolean(WORKER_URL && DOWNLOAD_SECRET) };
+}
+
 // ---------------------------------------------------------------- CORS
 // '*' rakhoge to koi bhi site aapka API apne tool me laga legi — aapke
 // session par, aapke risk par. Vercel env var ALLOWED_ORIGINS me apni site daalo.
@@ -577,12 +644,12 @@ export default async function handler(req, res) {
         if (debug) {
           // debug response cache hua to purana diagnostic data chipak jayega
           res.setHeader('Cache-Control', 'no-store');
-          return res.status(200).json({ ...data, cookies: cookieInfo, attempts });
+          return res.status(200).json({ ...addDownloadLinks(data), cookies: cookieInfo, attempts });
         }
         const ttl = cacheSeconds(data);
         res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
         res.setHeader('CDN-Cache-Control', `public, s-maxage=${ttl}`);
-        return res.status(200).json(data);
+        return res.status(200).json(addDownloadLinks(data));
       }
     } catch (e) {
       attempts.push({ tier: name, ok: false, reason: `${e.name}: ${e.message}` });
