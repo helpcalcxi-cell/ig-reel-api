@@ -1,5 +1,5 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v6
+//  Instagram Reel Downloader API  —  v7
 //
 //  v2 ka sabak: Instagram bina cookies ke sirf khaali web page deta hai.
 //  Isliye ab pehle guest cookies (csrftoken) leke aate hain, phir data maangte hain.
@@ -223,18 +223,26 @@ function webHeaders(jar, extra = {}) {
 
 // ---------------------------------------------------------------- normalize
 
+/** Ek node ka apna poster nikaalta hai — carousel me har slide ka alag hota hai */
+function posterOf(node) {
+  if (node.display_url) return clean(node.display_url);
+  const c = node.image_versions2?.candidates || [];
+  const best = [...c].sort((a, b) => (b.width || 0) - (a.width || 0))[0];
+  return best ? best.url : null;
+}
+
 function pickBest(node) {
-  if (node.video_url) return { type: 'video', url: clean(node.video_url) };
+  const poster = posterOf(node);
+
+  // ⚠️ `thumb` har item ka APNA hona chahiye. Post ka cover sabko de doge to
+  // 9-slide carousel me nau baar wahi ek photo dikhegi.
+  if (node.video_url) return { type: 'video', url: clean(node.video_url), thumb: poster };
 
   if (node.video_versions?.length) {
     const best = [...node.video_versions].sort((a, b) => (b.width || 0) - (a.width || 0))[0];
-    return { type: 'video', url: best.url, width: best.width, height: best.height };
+    return { type: 'video', url: best.url, width: best.width, height: best.height, thumb: poster };
   }
-  if (node.display_url) return { type: 'image', url: clean(node.display_url) };
-
-  const cands = node.image_versions2?.candidates || [];
-  const best = [...cands].sort((a, b) => (b.width || 0) - (a.width || 0))[0];
-  return best ? { type: 'image', url: best.url, width: best.width, height: best.height } : null;
+  return poster ? { type: 'image', url: poster, thumb: poster } : null;
 }
 
 /** GraphQL shape -> standard shape */
@@ -251,8 +259,12 @@ function fromGraphNode(m, shortcode) {
     video_url: firstVideo?.url || null,
     thumbnail_url: m.display_url ? clean(m.display_url) : null,
     username: m.owner?.username || null,
-    caption: (m.edge_media_to_caption?.edges?.[0]?.node?.text || '').slice(0, 300),
+    full_name: m.owner?.full_name || null,
+    caption: m.edge_media_to_caption?.edges?.[0]?.node?.text || '',
     duration: m.video_duration || null,
+    likes: m.edge_media_preview_like?.count ?? m.edge_liked_by?.count ?? null,
+    views: m.video_view_count ?? m.video_play_count ?? null,
+    audio_url: null,
     media,
   };
 }
@@ -263,14 +275,25 @@ function fromRestItem(item, shortcode) {
   const media = nodes.map(pickBest).filter(Boolean);
   const firstVideo = media.find((x) => x.type === 'video');
 
+  // Instagram alag jagah alag naam deta hai, isliye teeno dekhne padte hain
+  const clips = item.clips_metadata || {};
+  const audio =
+    clips.original_sound_info?.progressive_download_url ||
+    clips.music_info?.music_asset_info?.progressive_download_url ||
+    null;
+
   return {
     shortcode: item.code || shortcode,
     is_video: Boolean(firstVideo),
     video_url: firstVideo?.url || null,
     thumbnail_url: item.image_versions2?.candidates?.[0]?.url || null,
     username: item.user?.username || null,
-    caption: (item.caption?.text || '').slice(0, 300),
+    full_name: item.user?.full_name || null,
+    caption: item.caption?.text || '',
     duration: item.video_duration || null,
+    likes: item.like_count ?? null,
+    views: item.play_count ?? item.view_count ?? item.video_view_count ?? null,
+    audio_url: audio,
     media,
   };
 }
@@ -554,25 +577,45 @@ function addDownloadLinks(data) {
   const code = safeName(data.shortcode, 'media');
   const total = (data.media || []).length;
 
+  /** Ek URL ko Worker ke through signed link me badalta hai */
+  const via = (url, extra) => {
+    const exp = signExpiry(url);
+    const sig = createHmac('sha256', DOWNLOAD_SECRET).update(`${url}|${exp}`).digest('hex');
+    return `${WORKER_URL}/?u=${encodeURIComponent(url)}&exp=${exp}&sig=${sig}&${extra}`;
+  };
+
+  const on = Boolean(WORKER_URL && DOWNLOAD_SECRET);
+
   const media = (data.media || []).map((m, i) => {
     const ext = m.type === 'video' ? 'mp4' : 'jpg';
     const filename = `${user}_${code}${total > 1 ? `_${i + 1}` : ''}.${ext}`;
 
-    if (!WORKER_URL || !DOWNLOAD_SECRET) {
-      return { ...m, filename, download_url: m.url, forced: false };
+    if (!on) {
+      return { ...m, filename, download_url: m.url, media_url: m.url,
+               thumb_url: m.thumb || null, forced: false };
     }
 
-    const exp = signExpiry(m.url);
-    const sig = createHmac('sha256', DOWNLOAD_SECRET).update(`${m.url}|${exp}`).digest('hex');
-
-    const download_url =
-      `${WORKER_URL}/?u=${encodeURIComponent(m.url)}` +
-      `&exp=${exp}&sig=${sig}&name=${encodeURIComponent(filename)}`;
-
-    return { ...m, filename, download_url, forced: true };
+    return {
+      ...m,
+      filename,
+      // attachment — browser file save karega
+      download_url: via(m.url, `name=${encodeURIComponent(filename)}`),
+      // inline — <img>/<video> me dikhane ke liye, download trigger nahi hota
+      media_url: via(m.url, 'inline=1'),
+      thumb_url: m.thumb ? via(m.thumb, 'inline=1') : null,
+      forced: true,
+    };
   });
 
-  return { ...data, media, forced_download: Boolean(WORKER_URL && DOWNLOAD_SECRET) };
+  return {
+    ...data,
+    media,
+    thumbnail_proxy: on && data.thumbnail_url ? via(data.thumbnail_url, 'inline=1') : data.thumbnail_url,
+    audio_download_url: on && data.audio_url
+      ? via(data.audio_url, `name=${encodeURIComponent(user + '_' + code + '.m4a')}`)
+      : data.audio_url || null,
+    forced_download: on,
+  };
 }
 
 // ---------------------------------------------------------------- CORS
