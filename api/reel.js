@@ -1,13 +1,37 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v7
+//  Instagram Reel Downloader API  —  v8
 //
-//  v2 ka sabak: Instagram bina cookies ke sirf khaali web page deta hai.
-//  Isliye ab pehle guest cookies (csrftoken) leke aate hain, phir data maangte hain.
+//  v8 me do hi cheezein badli hain. Dono naap kar badli hain, tukke se nahi.
 //
-//  Tier 1: GraphQL          (csrftoken ke saath)
-//  Tier 2: Mobile API       (i.instagram.com — alag rasta, alag rules)
+//  1. TIER KA KRAM BADLA
+//
+//     v7 me sabse pehle mobile-api chalta tha (i.instagram.com) — yaani
+//     Instagram APP ka darwaza. Wahi darwaza `logout_reason: 33` bhejta tha,
+//     aur account ek din me mar jaata tha.
+//
+//     Ek competitor (igexport.com) ke CDN link ke andar `urlgen_source: "www"`
+//     likha mila — matlab wo WEB ka darwaza istemaal karte hain, app ka nahi.
+//     Aur wo zinda hain.
+//
+//     Test me dono chale: web-api ✅ aur mobile-api ✅ (dono session ke saath,
+//     Vercel ke apne IP se). To ab web-api pehle, mobile-api backup me.
+//
+//     Ye pakka saabit nahi hua ki isse account zyada jiyega — par ishara saaf
+//     hai, aur galat nikla to bhi nuksaan zero: mobile-api doosre number par
+//     khada hai, jaise pehle pehle number par tha.
+//
+//  2. GUEST COOKIES AB CACHE HOTI HAIN
+//
+//     v7 har request par instagram.com ka homepage (616 KB) download karta tha
+//     sirf csrftoken uthane ke liye. Naapa to pata chala ki ye ek request poore
+//     data kharche ka 93% kha rahi thi. Ab jar 30 minute cache hota hai.
+//
+//  Tier 1: Web API     (www.instagram.com — igexport bhi yahi use karte hain)
+//  Tier 2: Mobile API  (i.instagram.com — backup)
 //  Tier 3: Embed page
-//  Tier 4: Web API          (purana, ab shayad hi chale)
+//  Tier 4: GraphQL     (⚠️ doc_id purana hai, "execution error" deta hai —
+//                       isliye aakhir me. Naya doc_id mile to IG_DOC_ID env
+//                       var me daal dena, ye apne aap upar aa jayega.)
 //
 //  CDN cache andar hi hai — WordPress plugin ki zaroorat nahi.
 //  Debug: /api/reel?url=<link>&debug=1
@@ -92,12 +116,72 @@ function igMessageFrom(text) {
   }
 }
 
+/**
+ * Instagram ke jawab ke wo ishaare jo diagnose() ko CHAHIYE.
+ *
+ * ⚠️ Ye alag function isliye hai: `sample` (poora raw body) debug ke bina strip
+ * ho jaata hai, aur `logout_reason` sirf usi me hota tha. Nateeja ye tha ki
+ * LIVE par SESSION_KILLED kabhi diagnose hi nahi ho paata tha — hamesha
+ * SESSION_REJECTED aata tha, jo bilkul alag ilaaj batata hai:
+ *
+ *   SESSION_KILLED   -> account mar gaya, NAYA account banao
+ *   SESSION_REJECTED -> sessionid galat copy hui / expire, DOBARA copy karo
+ *
+ * Ye chhota object hamesha bheja jaata hai, debug ho ya na ho.
+ */
+function igSignals(text) {
+  try {
+    const j = JSON.parse(text);
+    const out = {};
+    if (j.error_title) out.error_title = j.error_title;
+    if (j.logout_reason !== undefined) out.logout_reason = j.logout_reason;
+    if (j.require_login) out.require_login = true;
+    if (j.checkpoint_url || j.challenge || j.challenge_required) out.challenge_required = true;
+    return Object.keys(out).length ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ---------------------------------------------------------------- cookies
 
 /**
  * Instagram se guest cookies leta hai (csrftoken, mid, ig_did).
  * Inke bina web endpoints sirf khaali page dete hain — v2 me yahi galti thi.
  */
+// Ek warm serverless instance kai requests handle karta hai. v7 me har request
+// par ye 616 KB ka homepage dobara utrta tha — bekaar. 30 minute cache kaafi hai:
+// csrftoken itni jaldi badalta nahi, aur galat ho bhi jaye to neeche wala
+// refresh-and-retry use theek kar deta hai.
+const COOKIE_TTL = 30 * 60 * 1000;
+let COOKIE_CACHE = { jar: null, at: 0, inflight: null };
+
+/**
+ * Cache se jar deta hai. `force` par Instagram se naya lekar aata hai.
+ * Ek saath aayi kai requests ek hi fetch ka intezaar karti hain (inflight),
+ * warna instance garam hote hi 10 requests 10 homepage utaar deti.
+ */
+async function getJar(force = false) {
+  const now = Date.now();
+  if (!force && COOKIE_CACHE.jar && now - COOKIE_CACHE.at < COOKIE_TTL) {
+    return { jar: COOKIE_CACHE.jar, cached: true, ageMs: now - COOKIE_CACHE.at };
+  }
+  if (COOKIE_CACHE.inflight) return COOKIE_CACHE.inflight;
+
+  COOKIE_CACHE.inflight = (async () => {
+    try {
+      const c = await getGuestCookies();
+      COOKIE_CACHE = { jar: c.jar, at: Date.now(), inflight: null };
+      return { jar: c.jar, cached: false, ageMs: 0, status: c.status, got: c.got };
+    } catch (e) {
+      COOKIE_CACHE.inflight = null;
+      throw e;
+    }
+  })();
+
+  return COOKIE_CACHE.inflight;
+}
+
 async function getGuestCookies() {
   const res = await fetch('https://www.instagram.com/', {
     headers: {
@@ -328,7 +412,7 @@ async function fromGraphQL(shortcode, jar) {
     return { ok: false, reason: `graphql ne HTML bheja (status ${res.status}) — cookies/doc_id kaam nahi kiye`, status: res.status, sample: text.slice(0, 300) };
   }
   if (!res.ok) {
-    return { ok: false, reason: `graphql HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), sample: text.slice(0, 400) };
+    return { ok: false, reason: `graphql HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), igSignal: igSignals(text), sample: text.slice(0, 400) };
   }
 
   let json;
@@ -375,7 +459,7 @@ async function fromMobileApi(shortcode, jar) {
     return { ok: false, reason: `mobile api ne HTML bheja (status ${res.status})`, status: res.status, sample: text.slice(0, 250) };
   }
   if (!res.ok) {
-    return { ok: false, reason: `mobile api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), sample: text.slice(0, 300) };
+    return { ok: false, reason: `mobile api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), igSignal: igSignals(text), sample: text.slice(0, 300) };
   }
 
   let json;
@@ -476,9 +560,17 @@ async function fromWebApi(shortcode, jar) {
 
   const text = await res.text();
   if (looksLikeHtml(text)) {
-    return { ok: false, reason: `web api ne HTML bheja (status ${res.status})`, status: res.status };
+    // Bada HTML matlab poora logged-out app shell — session nahi lagi.
+    // Ye flag diagnose() ko chahiye, warna wo UNKNOWN bol deta hai.
+    return {
+      ok: false,
+      reason: `web api ne HTML bheja (status ${res.status})`,
+      status: res.status,
+      htmlLength: text.length,
+      isAppShell: text.length > 300000,
+    };
   }
-  if (!res.ok) return { ok: false, reason: `web api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), sample: text.slice(0, 250) };
+  if (!res.ok) return { ok: false, reason: `web api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), igSignal: igSignals(text), sample: text.slice(0, 250) };
 
   let json;
   try { json = JSON.parse(text); }
@@ -657,46 +749,75 @@ export default async function handler(req, res) {
   const debug = req.query.debug === '1';
   const attempts = [];
 
-  // --- pehle guest cookies
+  // --- guest cookies (ab cache se, har baar 616 KB nahi)
   let jar = {};
   let cookieInfo = null;
   try {
-    const c = await getGuestCookies();
+    const c = await getJar();
     jar = c.jar;
-    cookieInfo = { status: c.status, got: c.got };
+    cookieInfo = { cached: c.cached, ageSec: Math.round(c.ageMs / 1000), got: c.got || Object.keys(c.jar) };
   } catch (e) {
     cookieInfo = { error: `${e.name}: ${e.message}` };
   }
 
+  // ⚠️ Kram soch-samajh kar hai, alphabetical ya purana nahi:
+  //   web-api    — www ka darwaza. Test me chala. igexport bhi yahi use karte hain.
+  //   mobile-api — app ka darwaza. Chalta hai, par logout_reason:33 yahin se aata tha.
+  //   embed      — bina session ke bhi kabhi-kabhi chal jaata hai.
+  //   graphql    — doc_id purana hone tak sabse aakhir me.
   const TIERS = [
-    ['graphql', fromGraphQL],
+    ['web-api', fromWebApi],
     ['mobile-api', fromMobileApi],
     ['embed', fromEmbed],
-    ['web-api', fromWebApi],
+    ['graphql', fromGraphQL],
   ];
 
-  for (const [name, fn] of TIERS) {
-    try {
-      const r = await fn(shortcode, jar);
-      const { ok, data, ...diag } = r;
-      // status aur igMessage HAMESHA jaate hain — diagnose() ko production me
-      // bhi inki zaroorat hai. Sirf raw body (`sample`) debug tak seemit hai.
-      const { sample, htmlLength, ...safeDiag } = diag;
-      attempts.push({ tier: name, ok, ...(debug ? diag : safeDiag) });
-      if (ok) {
-        if (debug) {
-          // debug response cache hua to purana diagnostic data chipak jayega
-          res.setHeader('Cache-Control', 'no-store');
-          return res.status(200).json({ ...addDownloadLinks(data), cookies: cookieInfo, attempts });
-        }
-        const ttl = cacheSeconds(data);
-        res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
-        res.setHeader('CDN-Cache-Control', `public, s-maxage=${ttl}`);
-        return res.status(200).json(addDownloadLinks(data));
+  /** Ek poora daur: saare tier ek-ek karke. Mil gaya to seedha bhej deta hai. */
+  const runTiers = async () => {
+    for (const [name, fn] of TIERS) {
+      try {
+        const r = await fn(shortcode, jar);
+        const { ok, data, ...diag } = r;
+        // status aur igMessage HAMESHA jaate hain — diagnose() ko production me
+        // bhi inki zaroorat hai. Sirf raw body (`sample`) debug tak seemit hai.
+        const { sample, htmlLength, ...safeDiag } = diag;
+        attempts.push({ tier: name, ok, ...(debug ? diag : safeDiag) });
+        if (ok) return data;
+      } catch (e) {
+        attempts.push({ tier: name, ok: false, reason: `${e.name}: ${e.message}` });
       }
-    } catch (e) {
-      attempts.push({ tier: name, ok: false, reason: `${e.name}: ${e.message}` });
     }
+    return null;
+  };
+
+  let data = await runTiers();
+
+  // Cookie cache ka ek khatra hai: purana csrftoken 30 minute tak chipka reh
+  // sakta hai. Isliye agar saare tier fail hue AUR jar cache se aaya tha, to
+  // ek baar taaza cookie lekar dobara koshish karo. Ye sirf tab chalta hai jab
+  // pehle hi sab fail ho chuka ho — normal request par extra kharcha zero.
+  if (!data && cookieInfo?.cached) {
+    attempts.push({ tier: '(cookie refresh)', ok: false, reason: 'saare tier fail — taazi cookies leke dobara' });
+    try {
+      const c2 = await getJar(true);
+      jar = c2.jar;
+      cookieInfo = { cached: false, ageSec: 0, refreshed: true, got: c2.got || Object.keys(c2.jar) };
+      data = await runTiers();
+    } catch (e) {
+      cookieInfo = { error: `${e.name}: ${e.message}`, refreshed: true };
+    }
+  }
+
+  if (data) {
+    if (debug) {
+      // debug response cache hua to purana diagnostic data chipak jayega
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(200).json({ ...addDownloadLinks(data), cookies: cookieInfo, attempts });
+    }
+    const ttl = cacheSeconds(data);
+    res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
+    res.setHeader('CDN-Cache-Control', `public, s-maxage=${ttl}`);
+    return res.status(200).json(addDownloadLinks(data));
   }
 
   const verdict = diagnose(attempts, Boolean(SESSIONID));
