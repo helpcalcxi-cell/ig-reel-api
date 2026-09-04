@@ -473,6 +473,38 @@ function hasUsableMedia(item) {
   );
 }
 
+
+/**
+ * Video URL ke `efg` param me duration chhupi hoti hai.
+ *
+ * Page wale JSON me `video_duration` nahi aata, par CDN link ke andar base64
+ * me ye likha hota hai: {"duration_s":22,"urlgen_source":"www",...}
+ * Ye wahi jagah hai jahan se pehle pata chala tha ki igexport bhi `www` use
+ * karte hain.
+ */
+function durationFromUrl(url) {
+  try {
+    const efg = new URL(url).searchParams.get('efg');
+    if (!efg) return null;
+    const j = JSON.parse(Buffer.from(efg, 'base64').toString('utf8'));
+    return typeof j.duration_s === 'number' ? j.duration_s : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * DASH manifest me audio ka alag track hota hai. Page me ye `video_dash_manifest`
+ * ke naam se milta hai — wahi `MPD` jo DevTools search me dikha tha.
+ */
+function audioFromDash(manifest) {
+  if (typeof manifest !== 'string' || !manifest) return null;
+  const m = manifest.match(/mimeType="audio\/mp4"[\s\S]{0,4000}?<BaseURL>([^<]+)<\/BaseURL>/i);
+  if (!m) return null;
+  const url = clean(m[1].trim());
+  return isRealMedia(url) ? url : null;
+}
+
 async function fromReelPage(shortcode) {
   const res = await fetch(`https://www.instagram.com/reel/${shortcode}/`, {
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
@@ -508,7 +540,19 @@ async function fromReelPage(shortcode) {
   }
 
   if (item && hasUsableMedia(item)) {
-    return { ok: true, data: { source: 'reel-page', ...fromRestItem(item, shortcode) } };
+    const out = fromRestItem(item, shortcode);
+
+    // Page ka JSON API se thoda kam deta hai — jo chhoot gaya, wo doosri jagah
+    // se bhar lete hain. Jo phir bhi na mile, use null hi rehne dete hain;
+    // jhoothi value bharne se bura kuch nahi.
+    if (out.duration == null) out.duration = durationFromUrl(out.video_url || '');
+    if (!out.audio_url) out.audio_url = audioFromDash(item.video_dash_manifest);
+    if (out.views == null) {
+      out.views = item.play_count ?? item.view_count ?? item.video_view_count ??
+                  item.ig_play_count ?? item.media_overlay_info?.play_count ?? null;
+    }
+
+    return { ok: true, data: { source: 'reel-page', ...out } };
   }
 
   return {
