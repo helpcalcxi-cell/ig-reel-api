@@ -354,8 +354,33 @@ function pickBest(node) {
   if (node.video_url) return { type: 'video', url: clean(node.video_url), thumb: poster };
 
   if (node.video_versions?.length) {
-    const best = [...node.video_versions].sort((a, b) => (b.width || 0) - (a.width || 0))[0];
-    return { type: 'video', url: best.url, width: best.width, height: best.height, thumb: poster };
+    const sorted = [...node.video_versions]
+      .filter((v) => v && v.url)
+      .sort((a, b) => (b.width || 0) - (a.width || 0));
+    const best = sorted[0];
+
+    // Instagram ek hi video ki kai quality bhejta hai (720p, 480p, 320p).
+    // v9.2 tak hum sirf sabse achhi rakh kar baaki phenk dete the. Ab saari
+    // bahar jaati hain taki user khud chun sake. Ek hi width do baar aa jaye
+    // to pehli hi rakhte hain, warna dropdown me "720p, 720p" dikhega.
+    const seen = new Set();
+    const variants = [];
+    for (const v of sorted) {
+      const w = v.width || 0, h = v.height || 0;
+      const p = w && h ? Math.min(w, h) : (w || h || 0);
+      if (!p || seen.has(p)) continue;
+      seen.add(p);
+      variants.push({ url: v.url, width: w || null, height: h || null, label: p + 'p' });
+    }
+
+    return {
+      type: 'video',
+      url: best.url,
+      width: best.width,
+      height: best.height,
+      thumb: poster,
+      ...(variants.length > 1 ? { variants } : {}),
+    };
   }
   return poster ? { type: 'image', url: poster, thumb: poster } : null;
 }
@@ -892,14 +917,30 @@ function addDownloadLinks(data) {
     const filename = `${user}_${code}${total > 1 ? `_${i + 1}` : ''}.${ext}`;
 
     if (!on) {
-      return { ...m, filename, download_url: m.url, media_url: m.url,
-               thumb_url: m.thumb || null, forced: false };
+      return {
+        ...m, filename, download_url: m.url, media_url: m.url,
+        thumb_url: m.thumb || null, forced: false,
+        ...(m.variants?.length
+          ? { variants: m.variants.map((v) => ({ ...v, download_url: v.url, media_url: v.url })) }
+          : {}),
+      };
     }
+
+    // Har quality ka apna signed link. Bina iske dropdown se quality badalne par
+    // link sign hi nahi hoti aur Worker use reject kar deta.
+    const variants = (m.variants || []).map((v) => ({
+      label: v.label,
+      width: v.width,
+      height: v.height,
+      download_url: via(v.url, `name=${encodeURIComponent(filename)}`),
+      media_url: via(v.url, 'inline=1'),
+    }));
 
     return {
       ...m,
       filename,
-      // attachment — browser file save karega
+      ...(variants.length ? { variants } : {}),
+      // attachment: browser file save karega
       download_url: via(m.url, `name=${encodeURIComponent(filename)}`),
       // inline — <img>/<video> me dikhane ke liye, download trigger nahi hota
       media_url: via(m.url, 'inline=1'),
@@ -912,6 +953,11 @@ function addDownloadLinks(data) {
     ...data,
     media,
     thumbnail_proxy: on && data.thumbnail_url ? via(data.thumbnail_url, 'inline=1') : data.thumbnail_url,
+    // Cover ka DOWNLOAD wala link. thumbnail_proxy inline hai, vo browser me
+    // khul jata hai; save karne ke liye `name=` wala alag link chahiye.
+    cover_download_url: on && data.thumbnail_url
+      ? via(data.thumbnail_url, `name=${encodeURIComponent(user + '_' + code + '_cover.jpg')}`)
+      : data.thumbnail_url || null,
     audio_download_url: on && data.audio_url
       ? via(data.audio_url, `name=${encodeURIComponent(user + '_' + code + '.m4a')}`)
       : data.audio_url || null,
