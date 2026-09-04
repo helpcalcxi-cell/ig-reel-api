@@ -57,6 +57,12 @@ const UA_MOBILE =
 // Iske bina bhi try hoga, par iske saath success rate bahut zyada hai.
 const SESSIONID = process.env.IG_SESSIONID || '';
 
+// Vercel Hobby ka function 10 second me kat jaata hai. Ek atki hui request
+// poora budget kha leti hai aur baaki tier chalte hi nahi — isliye har fetch
+// ki apni seema. 4 tier x 6s worst case bhi budget ke andar hai kyunki pehla
+// chal jane par baaki chalte hi nahi.
+const FETCH_TIMEOUT = 6000;
+
 // ---------------------------------------------------------------- helpers
 
 function extractShortcode(input) {
@@ -98,6 +104,13 @@ function firstMatch(text, patterns) {
 }
 
 /** Response HTML hai ya JSON — ye batata hai ki humein data mila ya web page */
+/** fetch ki asli wajah — `TypeError: fetch failed` ke peeche kya hai */
+function causeOf(e) {
+  const c = e?.cause;
+  if (!c) return e?.name === 'TimeoutError' ? `${FETCH_TIMEOUT}ms me jawab nahi aaya` : undefined;
+  return [c.code, c.message].filter(Boolean).join(' — ') || String(c);
+}
+
 function looksLikeHtml(text) {
   return /^\s*<(?:!doctype|html)/i.test(text);
 }
@@ -184,6 +197,7 @@ async function getJar(force = false) {
 
 async function getGuestCookies() {
   const res = await fetch('https://www.instagram.com/', {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
     headers: {
       'User-Agent': UA_WEB,
       'Accept-Language': 'en-US,en;q=0.9',
@@ -396,6 +410,7 @@ async function fromGraphQL(shortcode, jar) {
   });
 
   const res = await fetch('https://www.instagram.com/graphql/query/', {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
     method: 'POST',
     headers: webHeaders(jar, {
       'content-type': 'application/x-www-form-urlencoded',
@@ -452,7 +467,10 @@ async function fromMobileApi(shortcode, jar) {
     if (ds) headers['X-IG-Android-ID'] = `android-${ds.slice(0, 16)}`;
   }
 
-  const res = await fetch(`https://i.instagram.com/api/v1/media/${mediaId}/info/`, { headers });
+  const res = await fetch(`https://i.instagram.com/api/v1/media/${mediaId}/info/`, {
+    headers,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+  });
   const text = await res.text();
 
   if (looksLikeHtml(text)) {
@@ -483,6 +501,7 @@ async function fromMobileApi(shortcode, jar) {
 // ---------------------------------------------------------------- TIER 3
 async function fromEmbed(shortcode, jar) {
   const res = await fetch(`https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
     headers: {
       'User-Agent': UA_WEB,
       'Accept-Language': 'en-US,en;q=0.9',
@@ -552,6 +571,7 @@ async function fromWebApi(shortcode, jar) {
   const mediaId = shortcodeToMediaId(shortcode);
 
   const res = await fetch(`https://www.instagram.com/api/v1/media/${mediaId}/info/`, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
     headers: webHeaders(jar, {
       Accept: '*/*',
       Referer: `https://www.instagram.com/p/${shortcode}/`,
@@ -784,7 +804,10 @@ export default async function handler(req, res) {
         attempts.push({ tier: name, ok, ...(debug ? diag : safeDiag) });
         if (ok) return data;
       } catch (e) {
-        attempts.push({ tier: name, ok: false, reason: `${e.name}: ${e.message}` });
+        // `TypeError: fetch failed` apne aap me kuch nahi batata — asli wajah
+        // (connection reset, DNS, timeout) e.cause me hoti hai. Use bahar
+        // nikalna zaroori hai, warna har network dikkat ek jaisi dikhti hai.
+        attempts.push({ tier: name, ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
       }
     }
     return null;
