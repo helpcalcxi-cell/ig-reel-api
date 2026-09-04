@@ -1,9 +1,24 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v8
+//  Instagram Reel Downloader API  —  v9
 //
-//  v8 me do hi cheezein badli hain. Dono naap kar badli hain, tukke se nahi.
+//  v9 KI BADI BAAT: ab zyadatar reels ke liye INSTAGRAM ACCOUNT CHAHIYE HI NAHI.
 //
-//  1. TIER KA KRAM BADLA
+//  Aayush ne incognito me (bina login ke) reel kholi aur DevTools me
+//  `video_versions` search kiya. Vo seedha `/reel/{shortcode}/` ke HTML ke
+//  andar mila. Pehle `.mp4` search kiya tha aur kuch nahi mila — kyunki JSON me
+//  har slash escape hota hai (`https:\/\/`), isliye ye cheez chhupi rahi.
+//
+//  Hamare saare purane tier API endpoints par jaate the. PAGE kabhi fetch hi
+//  nahi kiya tha. Test me vo bina session ke, Vercel ke apne IP se chal gaya —
+//  reel, photo, aur 5-slide carousel, teeno.
+//
+//  ⚠️ Par ye har baar nahi chalta. Kuch Vercel IP flagged hain: unse wahi
+//     khaali 492 KB ka page aata hai. Isliye purane tier hataye NAHI gaye —
+//     ve peeche backup me khade hain, sessionid ke saath.
+//
+//  v8 wale do badlaav bhi bane hue hain:
+//
+//  1. TIER KA KRAM
 //
 //     v7 me sabse pehle mobile-api chalta tha (i.instagram.com) — yaani
 //     Instagram APP ka darwaza. Wahi darwaza `logout_reason: 33` bhejta tha,
@@ -26,12 +41,14 @@
 //     sirf csrftoken uthane ke liye. Naapa to pata chala ki ye ek request poore
 //     data kharche ka 93% kha rahi thi. Ab jar 30 minute cache hota hai.
 //
-//  Tier 1: Web API     (www.instagram.com — igexport bhi yahi use karte hain)
-//  Tier 2: Mobile API  (i.instagram.com — backup)
-//  Tier 3: Embed page
-//  Tier 4: GraphQL     (⚠️ doc_id purana hai, "execution error" deta hai —
+//  Tier 1: Reel page   (/reel/{code}/ — BINA session. Chal gaya to cookies tak
+//                       nahi mangwate, kyunki page ko unki zarurat hi nahi.)
+//  Tier 2: Web API     (www.instagram.com — session ke saath)
+//  Tier 3: Mobile API  (i.instagram.com — session ke saath)
+//  Tier 4: Embed page
+//  Tier 5: GraphQL     (⚠️ doc_id purana hai, "execution error" deta hai —
 //                       isliye aakhir me. Naya doc_id mile to IG_DOC_ID env
-//                       var me daal dena, ye apne aap upar aa jayega.)
+//                       var me daal dena.)
 //
 //  CDN cache andar hi hai — WordPress plugin ki zaroorat nahi.
 //  Debug: /api/reel?url=<link>&debug=1
@@ -283,7 +300,7 @@ function diagnose(attempts, hasSession) {
         }
       : {
           code: 'NEED_LOGIN',
-          meaning: 'Anonymous access band hai. Vercel me IG_SESSIONID env var set karo.',
+          meaning: 'reel-page bhi gira aur koi sessionid bhi nahi hai. Ya to ye Vercel IP flagged hai (thodi der baad khud theek ho sakta hai), ya IG_SESSIONID env var set karna padega.',
         };
   }
   if (/Please wait a few minutes|rate.?limit|Try again later/i.test(blob)) {
@@ -393,6 +410,115 @@ function fromRestItem(item, shortcode) {
     views: item.play_count ?? item.view_count ?? item.video_view_count ?? null,
     audio_url: audio,
     media,
+  };
+}
+
+
+// ---------------------------------------------------------------- TIER: reel page
+//
+// Ye page ke andar chhupa hua JSON padhta hai. Faayda ye hai ki us JSON ka
+// dhaancha bilkul wahi hai jo mobile/web API deta hai — isliye seedha
+// fromRestItem() me daal dete hain aur audio, likes, views, duration, aur
+// carousel ke har slide ka apna thumbnail — sab muft me mil jaata hai.
+
+const STATIC_ASSET = /static\.cdninstagram\.com|\/rsrc\.php\//i;
+
+/**
+ * Kya ye sach me media hai, ya Instagram ke UI ka koi icon?
+ *
+ * ⚠️ Ye check hone se pehle ek galat version ne `og:image` se Instagram ka
+ *    apna logo utha kar "mil gaya" bol diya tha, jabki page bilkul khaali tha.
+ *    Isliye host ki jaanch ab pehle hoti hai.
+ */
+function isRealMedia(u) {
+  if (typeof u !== 'string' || !u) return false;
+  if (!/(?:cdninstagram\.com|fbcdn\.net)/i.test(u)) return false;
+  return !STATIC_ASSET.test(u);
+}
+
+function jsonBlobs(html) {
+  const out = [];
+  for (const m of html.matchAll(/<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)) {
+    try { out.push(JSON.parse(m[1])); } catch { /* har blob JSON nahi hota */ }
+  }
+  return out;
+}
+
+/**
+ * Gehraai me ja kar media item dhoondhta hai. Instagram ka JSON bahut ghont kar
+ * rakha hota hai, seedha rasta nahi hota. `code` milne wala item sabse behtar.
+ */
+function findMediaItem(node, shortcode, depth = 0, best = { exact: null, any: null }) {
+  if (!node || typeof node !== 'object' || depth > 40) return best;
+  if (Array.isArray(node)) {
+    for (const x of node) findMediaItem(x, shortcode, depth + 1, best);
+    return best;
+  }
+  if (node.video_versions || node.carousel_media || node.image_versions2) {
+    if (node.code === shortcode && !best.exact) best.exact = node;
+    else if (!best.any) best.any = node;
+  }
+  for (const k of Object.keys(node)) findMediaItem(node[k], shortcode, depth + 1, best);
+  return best;
+}
+
+/** Item me kam se kam ek asli media URL hai ya nahi */
+function hasUsableMedia(item) {
+  const nodes = item.carousel_media?.length ? item.carousel_media : [item];
+  return nodes.some((n) =>
+    n.video_versions?.some((v) => isRealMedia(v?.url)) ||
+    n.video_url && isRealMedia(n.video_url) ||
+    (n.image_versions2?.candidates || []).some((c) => isRealMedia(c?.url)) ||
+    (n.display_url && isRealMedia(n.display_url))
+  );
+}
+
+async function fromReelPage(shortcode) {
+  const res = await fetch(`https://www.instagram.com/reel/${shortcode}/`, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+    redirect: 'follow',
+    headers: {
+      // Asli browser ka NAVIGATION jaisa. Baaki tier XHR jaise headers bhejte
+      // hain, jo Instagram ko bilkul alag dikhte hain.
+      'User-Agent': UA_WEB,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Upgrade-Insecure-Requests': '1',
+      'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      // ⚠️ Yahan koi Cookie nahi — na guest, na session. Yahi is tier ki jaan hai.
+    },
+  });
+
+  const html = await res.text();
+  const facts = { htmlLength: html.length, hasVideoVersions: html.includes('video_versions') };
+
+  if (!res.ok) return { ok: false, reason: `reel page HTTP ${res.status}`, status: res.status, ...facts };
+
+  let item = null;
+  for (const blob of jsonBlobs(html)) {
+    const f = findMediaItem(blob, shortcode);
+    item = f.exact || f.any;
+    if (item) break;
+  }
+
+  if (item && hasUsableMedia(item)) {
+    return { ok: true, data: { source: 'reel-page', ...fromRestItem(item, shortcode) } };
+  }
+
+  return {
+    ok: false,
+    status: res.status,
+    reason: facts.hasVideoVersions
+      ? 'reel page me data to hai par nikal nahi paye'
+      : 'reel page khaali aaya — Instagram ne is IP ko logged-out visitor maana',
+    ...facts,
+    isAppShell: html.length > 300000 && !facts.hasVideoVersions,
   };
 }
 
@@ -769,21 +895,28 @@ export default async function handler(req, res) {
   const debug = req.query.debug === '1';
   const attempts = [];
 
-  // --- guest cookies (ab cache se, har baar 616 KB nahi)
-  let jar = {};
+  // --- Tier 0: reel page. Ise cookies chahiye hi NAHI, isliye sabse pehle
+  //     chalta hai aur cookie bootstrap se PEHLE. Chal gaya to us 616 KB wale
+  //     homepage ko chhuna hi nahi padta — na data lagta, na waqt.
+  let data = null;
   let cookieInfo = null;
+  let jar = {};
+
   try {
-    const c = await getJar();
-    jar = c.jar;
-    cookieInfo = { cached: c.cached, ageSec: Math.round(c.ageMs / 1000), got: c.got || Object.keys(c.jar) };
+    const r = await fromReelPage(shortcode);
+    const { ok, data: d, ...diag } = r;
+    const { sample, htmlLength, ...safeDiag } = diag;
+    attempts.push({ tier: 'reel-page', ok, ...(debug ? diag : safeDiag) });
+    if (ok) data = d;
   } catch (e) {
-    cookieInfo = { error: `${e.name}: ${e.message}` };
+    attempts.push({ tier: 'reel-page', ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
   }
 
-  // ⚠️ Kram soch-samajh kar hai, alphabetical ya purana nahi:
-  //   web-api    — www ka darwaza. Test me chala. igexport bhi yahi use karte hain.
+  // ⚠️ Kram soch-samajh kar hai:
+  //   reel-page  — bina account. Zyadatar yahin kaam ho jaata hai.
+  //   web-api    — www ka darwaza, session ke saath. igexport bhi yahi use karte hain.
   //   mobile-api — app ka darwaza. Chalta hai, par logout_reason:33 yahin se aata tha.
-  //   embed      — bina session ke bhi kabhi-kabhi chal jaata hai.
+  //   embed      — kabhi-kabhi bina session ke bhi chal jaata hai.
   //   graphql    — doc_id purana hone tak sabse aakhir me.
   const TIERS = [
     ['web-api', fromWebApi],
@@ -792,17 +925,17 @@ export default async function handler(req, res) {
     ['graphql', fromGraphQL],
   ];
 
-  /** Ek poora daur: saare tier ek-ek karke. Mil gaya to seedha bhej deta hai. */
+  /** Baaki tier — inhe cookies chahiye, isliye ye reel-page ke girne par hi chalte hain. */
   const runTiers = async () => {
     for (const [name, fn] of TIERS) {
       try {
         const r = await fn(shortcode, jar);
-        const { ok, data, ...diag } = r;
+        const { ok, data: d, ...diag } = r;
         // status aur igMessage HAMESHA jaate hain — diagnose() ko production me
         // bhi inki zaroorat hai. Sirf raw body (`sample`) debug tak seemit hai.
         const { sample, htmlLength, ...safeDiag } = diag;
         attempts.push({ tier: name, ok, ...(debug ? diag : safeDiag) });
-        if (ok) return data;
+        if (ok) return d;
       } catch (e) {
         // `TypeError: fetch failed` apne aap me kuch nahi batata — asli wajah
         // (connection reset, DNS, timeout) e.cause me hoti hai. Use bahar
@@ -813,7 +946,17 @@ export default async function handler(req, res) {
     return null;
   };
 
-  let data = await runTiers();
+  // reel-page gira — ab cookies lao aur baaki tier chalao
+  if (!data) {
+    try {
+      const c = await getJar();
+      jar = c.jar;
+      cookieInfo = { cached: c.cached, ageSec: Math.round(c.ageMs / 1000), got: c.got || Object.keys(c.jar) };
+    } catch (e) {
+      cookieInfo = { error: `${e.name}: ${e.message}` };
+    }
+    data = await runTiers();
+  }
 
   // Cookie cache ka ek khatra hai: purana csrftoken 30 minute tak chipka reh
   // sakta hai. Isliye agar saare tier fail hue AUR jar cache se aaya tha, to
