@@ -493,6 +493,25 @@ function durationFromUrl(url) {
   }
 }
 
+const XML_ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+
+/**
+ * XML wali escaping kholta hai.
+ *
+ * ⚠️ Ye zaroori hai aur iski wajah asli hai: DASH manifest XML hai, aur XML me
+ *    har `&` `&amp;` likha jaata hai. Bina isko kholе audio link aisa jaata tha:
+ *        ...mp4?_nc_cat=105&amp;_nc_sid=9ca052&amp;oe=6A9CB076
+ *    Instagram aise params nahi pehchanta — download toot jaata. Aur `oe` ka
+ *    naam `amp;oe` ban jaata, isliye link ki asli expiry bhi nahi mil paati thi.
+ *
+ * Ek hi pass me badalta hai, warna `&amp;lt;` do baar khul kar `<` ban jata.
+ */
+function decodeXmlEntities(str) {
+  return str.replace(/&(amp|lt|gt|quot|apos|#\d+);/g, (whole, key) =>
+    key.startsWith('#') ? String.fromCharCode(Number(key.slice(1))) : (XML_ENT[key] ?? whole)
+  );
+}
+
 /**
  * DASH manifest me audio ka alag track hota hai. Page me ye `video_dash_manifest`
  * ke naam se milta hai — wahi `MPD` jo DevTools search me dikha tha.
@@ -501,7 +520,7 @@ function audioFromDash(manifest) {
   if (typeof manifest !== 'string' || !manifest) return null;
   const m = manifest.match(/mimeType="audio\/mp4"[\s\S]{0,4000}?<BaseURL>([^<]+)<\/BaseURL>/i);
   if (!m) return null;
-  const url = clean(m[1].trim());
+  const url = decodeXmlEntities(clean(m[1].trim()));
   return isRealMedia(url) ? url : null;
 }
 
