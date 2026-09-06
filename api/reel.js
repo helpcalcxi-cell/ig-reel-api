@@ -1,5 +1,20 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v9
+//  Instagram Reel Downloader API  —  v9.6
+//
+//  v9.6 me kya naya:
+//
+//  1. AGE GATE PEHCHANA JAATA HAI. Jo post age-restricted hai uska page 200 OK
+//     aur 650+ KB aata hai par media hata hua hota hai. Pehle ye "app shell"
+//     lagta tha, yaani hamari galti — 502, koi cache nahi, aur ek Apify call
+//     jo waise bhi fail hoti. Ab ye 404 hai, 10 minute cache ke saath, aur
+//     user ko saaf message milta hai.
+//
+//  2. SHARE TOKEN (stkn / igsh) ab phenka nahi jaata. Saaf URL pehle, aur
+//     girne par ek baar token ke saath. Age gate par ye retry chalta hi nahi,
+//     kyunki test me saabit ho gaya ki token us deewar ko nahi kholta.
+//
+//  v9.5 se: control probe (galti kiski hai, ye pata karne ke liye), 7 second
+//  ka tier budget, aur saare user-facing message English me.
 //
 //  v9 KI BADI BAAT: ab zyadatar reels ke liye INSTAGRAM ACCOUNT CHAHIYE HI NAHI.
 //
@@ -80,6 +95,87 @@ const SESSIONID = process.env.IG_SESSIONID || '';
 // chal jane par baaki chalte hi nahi.
 const FETCH_TIMEOUT = 6000;
 
+// Poore tier-kaam ka total budget. Har fetch ki apni seema hai, par jab har
+// tier girta hai to woh seemayein jud kar 8-9 second bana deti hain. Vercel
+// ka function usse thoda hi upar katta hai, aur user ke liye 8 second wait
+// karke error dekhna sabse bura anubhav hai. Isliye ek chhatri deadline.
+const TIER_BUDGET_MS = 7000;
+
+// Ek tier chalane layak kam se kam waqt. Isse kam bacha ho to nayi koshish
+// shuru karne ka matlab nahi — woh sirf budget khayegi aur adhoori maregi.
+const MIN_TIER_MS = 1500;
+
+// Aakhri kaamyaab request ka waqt. Ye is instance ki yaad hai, aur iska ek
+// hi kaam hai: fail hone par ye batana ki galti kiski hai.
+//
+//   Abhi kisi aur reel ko theek serve kiya tha  -> hamara IP/session theek hai,
+//                                                  to YE reel hi private/deleted hai -> 404
+//   Kaafi der se kuch bhi serve nahi hua        -> shayad hamari taraf dikkat hai -> 502
+//
+// 404 cache hota hai aur Apify fallback ko nahi bulata. 502 nahi hota aur
+// bulata hai. Isliye ye farak seedha paise aur speed par asar daalta hai.
+let lastSuccessAt = 0;
+const RECENT_SUCCESS_MS = 5 * 60 * 1000;
+
+// lastSuccessAt akela kaafi NAHI hai, aur wajah samajhna zaroori hai:
+// kaamyaab jawab CDN par cache hote hain (s-maxage), isliye woh dobara
+// function tak pahunchte hi nahi. Vercel kai instance chalata hai, to ek
+// naye instance ki yaad khaali hoti hai aur woh har fail par 502 de deta.
+// Live par yahi "hamesha Apify par chala jaata hai" jaisa dikhta hai.
+//
+// Isliye asli faisla ek control post se hota hai. Jab sab fail ho jaye, to
+// ek aisi post maango jo hamesha public hai:
+//
+//   control mil gayi   -> hamara IP theek hai -> jo post maangi thi WAHI gayab hai -> 404
+//   control bhi nahi   -> hamari taraf dikkat hai -> 502 -> Apify sambhale
+//
+// Ye instance ki yaad par nirbhar nahi hai, isliye har jagah ek jaisa chalta hai.
+const CONTROL_SHORTCODE = process.env.IG_CONTROL_SHORTCODE || 'DbdoGAQMg8O';
+const CONTROL_TTL_MS = 60 * 1000;
+const CONTROL_TIMEOUT_MS = 2500;
+let controlProbe = { at: 0, ok: false };
+
+/** Kya Instagram is server se abhi baat kar raha hai? Jawab 60s cache hota hai. */
+async function ipLooksHealthy() {
+  if (controlProbe.at && Date.now() - controlProbe.at < CONTROL_TTL_MS) return controlProbe.ok;
+  let ok = false;
+  try {
+    const r = await fromReelPage(CONTROL_SHORTCODE, CONTROL_TIMEOUT_MS);
+    ok = Boolean(r && r.ok);
+  } catch { ok = false; }
+  controlProbe = { at: Date.now(), ok };
+  return ok;
+}
+
+// In verdicts ka matlab "post hi nahi mili" ho sakta hai. RATE_LIMITED,
+// CHALLENGE aur SESSION_KILLED jaan-bujh kar bahar hain — woh saaf taur par
+// hamari taraf ki dikkat hain aur unme Apify fallback chalna hi chahiye.
+const POST_LIKELY_CODES = new Set(['NEED_LOGIN', 'SESSION_REJECTED', 'APP_SHELL', 'UNKNOWN']);
+
+// v9.6 — AGE GATE
+// Aayush ne `Dc8DvIXgZA_` ko do URL se khola: saada URL, aur share button
+// wala `stkn` URL. Dono par Instagram ne likha:
+//   "Age-restricted content — This content is age-restricted based on your
+//    age or account settings. Log in to continue."
+// Yahi wajah thi ki us post ka page 200 OK aur 658 KB aata tha par uske andar
+// `video_versions` tha hi nahi. Post public hai, media jaan-bujh kar hataya
+// gaya hai. Bina logged-in adult account ke ye kabhi nahi milega — na hamare
+// tier se, na Apify se. Isliye ise pehchan kar seedha 404 dena hi sahi hai:
+// user ko sach pata chalta hai, aur ek bekaar Apify call bachti hai.
+//
+// ⚠️ Ye check SIRF failure ke raste par chalta hai. Normal page ke JSON me
+//    `"is_age_restricted":false` aata hai, aur agar ise success par bhi
+//    chalate to wo false positive de sakta tha.
+const AGE_GATE_RE =
+  /Age-restricted content|restricted based on your age|"is_age_restricted"\s*:\s*true|age_restricted_content/i;
+
+// Kuch halaat me hum pakke taur par jaante hain ki hua kya — un par user ko
+// gol-mol jawab dena bekaar hai. Baaki sab aam jawab par girte hain.
+const USER_ERROR = {
+  AGE_RESTRICTED: 'This post is age restricted on Instagram, so it cannot be downloaded without logging in',
+  REEL_NOT_FOUND: 'This post is private, has been deleted, or the link is wrong',
+};
+
 // ---------------------------------------------------------------- helpers
 
 function extractShortcode(input) {
@@ -90,6 +186,32 @@ function extractShortcode(input) {
     /instagram\.com\/(?:[A-Za-z0-9._]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i
   );
   return m ? m[1] : null;
+}
+
+/**
+ * v9.6 — share token.
+ *
+ * Instagram app ka "Copy link" aur web ka share button aise URL dete hain:
+ *   /reel/ABC/?utm_source=ig_web_copy_link&stkn=NTc4...
+ *   /reel/ABC/?igsh=MWx5...
+ *
+ * Ab tak hum ye token phenk dete the aur hamesha saaf URL maangte the.
+ * Test se pata chala ki age-restricted post ko token bhi nahi kholta — par
+ * baaki halaat me ye ek muft mauka hai, aur hamare bahut se user waise hi
+ * app se copy kiya hua tokenised link paste karte hain.
+ *
+ * Isliye token ka istemaal RETRY ki tarah hota hai, pehli koshish ki tarah
+ * nahi: saaf URL pehle (uska CDN cache sab users me saanjha rehta hai), aur
+ * girne par ek baar token ke saath.
+ */
+function extractShareToken(input) {
+  if (!input) return null;
+  const m = String(input).match(/[?&](stkn|igsh)=([A-Za-z0-9._\-=%]{4,200})/i);
+  if (!m) return null;
+  let value = m[2];
+  try { value = decodeURIComponent(value); } catch { /* jaisa hai waisa hi rehne do */ }
+  if (!value || value.length > 200) return null;
+  return { name: m[1].toLowerCase(), value };
 }
 
 function shortcodeToMediaId(shortcode) {
@@ -124,7 +246,7 @@ function firstMatch(text, patterns) {
 /** fetch ki asli wajah — `TypeError: fetch failed` ke peeche kya hai */
 function causeOf(e) {
   const c = e?.cause;
-  if (!c) return e?.name === 'TimeoutError' ? `${FETCH_TIMEOUT}ms me jawab nahi aaya` : undefined;
+  if (!c) return e?.name === 'TimeoutError' ? `no response within ${FETCH_TIMEOUT}ms` : undefined;
   return [c.code, c.message].filter(Boolean).join(' — ') || String(c);
 }
 
@@ -270,12 +392,24 @@ function cookieHeader(jar) {
 function diagnose(attempts, hasSession) {
   const blob = JSON.stringify(attempts);
 
+  // Sabse pehle age gate — kyunki ye sabse pakka jawab hai. Page 200 aata hai,
+  // bhaari hota hai, par media hataya hua hota hai. Isme na hamara IP kharab
+  // hai na session, isliye control probe chalane ka bhi matlab nahi.
+  if (attempts.some((a) => a.ageRestricted)) {
+    return {
+      code: 'AGE_RESTRICTED',
+      meaning:
+        'Instagram has marked this post as age restricted and only serves it to logged in adult accounts, so it cannot be downloaded anonymously.',
+      reelFault: true,
+    };
+  }
+
   // Reel khud hi nahi hai (private/deleted) — ye humari galti nahi hai.
   // Ise alag pehchanna zaroori hai kyunki iska HTTP status alag hota hai (neeche dekho).
   if (attempts.some((a) => a.status === 404) && !/login_required|require_login|challenge/i.test(blob)) {
     return {
       code: 'REEL_NOT_FOUND',
-      meaning: 'Ye reel private hai, delete ho gayi hai, ya link galat hai.',
+      meaning: 'This post is private, has been deleted, or the link is wrong.',
       reelFault: true,
     };
   }
@@ -283,39 +417,39 @@ function diagnose(attempts, hasSession) {
   if (/challenge_required|checkpoint_required/i.test(blob)) {
     return {
       code: 'CHALLENGE',
-      meaning: 'Instagram ne account par verification laga di. Ye account ab is server se kaam nahi karega — naya account banana padega.',
+      meaning: 'Instagram has put a verification challenge on the account. It will no longer work from this server and needs replacing.',
     };
   }
   if (/logout_reason|You.{0,3}ve Been Logged Out/i.test(blob) && hasSession) {
     return {
       code: 'SESSION_KILLED',
-      meaning: 'sessionid mar chuka hai. Account ban hua ya Instagram ne logout kar diya.',
+      meaning: 'The sessionid is dead. The account was banned or Instagram logged it out.',
     };
   }
   if (/login_required|require_login/i.test(blob)) {
     return hasSession
       ? {
           code: 'SESSION_REJECTED',
-          meaning: 'sessionid accept nahi hua — galat copy hua, expire ho gaya, ya IP ki wajah se reject hua.',
+          meaning: 'The sessionid was rejected. It was copied wrong, has expired, or was refused because of the server IP.',
         }
       : {
           code: 'NEED_LOGIN',
-          meaning: 'reel-page bhi gira aur koi sessionid bhi nahi hai. Ya to ye Vercel IP flagged hai (thodi der baad khud theek ho sakta hai), ya IG_SESSIONID env var set karna padega.',
+          meaning: 'The reel-page tier failed and there is no sessionid. Either this server IP is flagged, which often clears on its own, or IG_SESSIONID needs to be set.',
         };
   }
   if (/Please wait a few minutes|rate.?limit|Try again later/i.test(blob)) {
     return {
       code: 'RATE_LIMITED',
-      meaning: 'Server ka IP flag ho chuka hai. Thodi der baad chal sakta hai, par asli ilaaj residential proxy hai.',
+      meaning: 'The server IP has been rate limited. It may clear shortly, but the real fix is a residential proxy.',
     };
   }
   if (/isAppShell":true/.test(blob)) {
     return {
       code: 'APP_SHELL',
-      meaning: 'Instagram ne data ki jagah khaali web page bheja — humein logged-out visitor maan raha hai.',
+      meaning: 'Instagram returned an empty app shell instead of data, meaning it is treating this server as a logged out visitor.',
     };
   }
-  return { code: 'UNKNOWN', meaning: 'Pehchana nahi gaya. Poora attempts output bhejo.' };
+  return { code: 'UNKNOWN', meaning: 'Not recognised. Send the full attempts output for diagnosis.' };
 }
 
 function webHeaders(jar, extra = {}) {
@@ -549,9 +683,15 @@ function audioFromDash(manifest) {
   return isRealMedia(url) ? url : null;
 }
 
-async function fromReelPage(shortcode) {
-  const res = await fetch(`https://www.instagram.com/reel/${shortcode}/`, {
-    signal: AbortSignal.timeout(FETCH_TIMEOUT),
+async function fromReelPage(shortcode, timeoutMs = FETCH_TIMEOUT, token = null) {
+  // Token wala URL bilkul waisa banate hain jaisa Instagram ka apna share
+  // button deta hai — utm_source ke saath — taki request unke liye normal lage.
+  const qs = token
+    ? `?utm_source=ig_web_copy_link&${token.name}=${encodeURIComponent(token.value)}`
+    : '';
+
+  const res = await fetch(`https://www.instagram.com/reel/${shortcode}/${qs}`, {
+    signal: AbortSignal.timeout(timeoutMs),
     redirect: 'follow',
     headers: {
       // Asli browser ka NAVIGATION jaisa. Baaki tier XHR jaise headers bhejte
@@ -599,14 +739,25 @@ async function fromReelPage(shortcode) {
     return { ok: true, data: { source: 'reel-page', ...out } };
   }
 
+  // Ab jab media nahi mila, tabhi age gate dekhte hain. Success ke raste par
+  // ye kabhi nahi chalta, isliye `"is_age_restricted":false` wala false
+  // positive ho hi nahi sakta.
+  const ageRestricted = AGE_GATE_RE.test(html);
+
   return {
     ok: false,
     status: res.status,
-    reason: facts.hasVideoVersions
-      ? 'reel page me data to hai par nikal nahi paye'
-      : 'reel page khaali aaya — Instagram ne is IP ko logged-out visitor maana',
+    reason: ageRestricted
+      ? 'the reel page loaded but Instagram replaced the media with an age restriction notice'
+      : facts.hasVideoVersions
+        ? 'the reel page carried media data but it could not be parsed'
+        : 'the reel page came back without media, so Instagram treated this server as a logged out visitor',
     ...facts,
-    isAppShell: html.length > 300000 && !facts.hasVideoVersions,
+    ageRestricted,
+    // Age gate ek asli page hai jisme se media hataya gaya hai — app shell
+    // nahi. Dono ko alag rakhna zaroori hai, kyunki app shell hamari galti
+    // hoti hai aur age gate post ki apni baat.
+    isAppShell: !ageRestricted && html.length > 300000 && !facts.hasVideoVersions,
   };
 }
 
@@ -638,7 +789,7 @@ async function fromGraphQL(shortcode, jar) {
   const text = await res.text();
 
   if (looksLikeHtml(text)) {
-    return { ok: false, reason: `graphql ne HTML bheja (status ${res.status}) — cookies/doc_id kaam nahi kiye`, status: res.status, sample: text.slice(0, 300) };
+    return { ok: false, reason: `graphql returned HTML instead of JSON (status ${res.status}); cookies or doc_id did not work`, status: res.status, sample: text.slice(0, 300) };
   }
   if (!res.ok) {
     return { ok: false, reason: `graphql HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), igSignal: igSignals(text), sample: text.slice(0, 400) };
@@ -652,7 +803,7 @@ async function fromGraphQL(shortcode, jar) {
   if (!m) {
     return {
       ok: false,
-      reason: 'graphql me media null — doc_id purana ho sakta hai',
+      reason: 'graphql returned a null media object; the doc_id may be out of date',
       status: res.status,
       igMessage: json?.message || json?.errors?.[0]?.message || null,
       sample: text.slice(0, 400),
@@ -688,7 +839,7 @@ async function fromMobileApi(shortcode, jar) {
   const text = await res.text();
 
   if (looksLikeHtml(text)) {
-    return { ok: false, reason: `mobile api ne HTML bheja (status ${res.status})`, status: res.status, sample: text.slice(0, 250) };
+    return { ok: false, reason: `mobile api returned HTML instead of JSON (status ${res.status})`, status: res.status, sample: text.slice(0, 250) };
   }
   if (!res.ok) {
     return { ok: false, reason: `mobile api HTTP ${res.status}`, status: res.status, igMessage: igMessageFrom(text), igSignal: igSignals(text), sample: text.slice(0, 300) };
@@ -702,7 +853,7 @@ async function fromMobileApi(shortcode, jar) {
   if (!item) {
     return {
       ok: false,
-      reason: 'mobile api me items nahi mile',
+      reason: 'mobile api response had no items',
       status: res.status,
       igMessage: json?.message || json?.error_type || null,
       sample: text.slice(0, 300),
@@ -756,7 +907,7 @@ async function fromEmbed(shortcode, jar) {
 
     return {
       ok: false,
-      reason: 'embed me media nahi mila',
+      reason: 'embed page had no media',
       status: res.status,
       htmlLength: html.length,
       mediaCdnLinks: cdn,
@@ -798,7 +949,7 @@ async function fromWebApi(shortcode, jar) {
     // Ye flag diagnose() ko chahiye, warna wo UNKNOWN bol deta hai.
     return {
       ok: false,
-      reason: `web api ne HTML bheja (status ${res.status})`,
+      reason: `web api returned HTML instead of JSON (status ${res.status})`,
       status: res.status,
       htmlLength: text.length,
       isAppShell: text.length > 300000,
@@ -812,7 +963,7 @@ async function fromWebApi(shortcode, jar) {
 
   const item = json?.items?.[0];
   if (!item) {
-    return { ok: false, reason: 'web api me items nahi mile', status: res.status, igMessage: json?.message || null };
+    return { ok: false, reason: 'web api response had no items', status: res.status, igMessage: json?.message || null };
   }
 
   return { ok: true, data: { source: 'web-api', ...fromRestItem(item, shortcode) } };
@@ -992,16 +1143,20 @@ export default async function handler(req, res) {
   applyCors(req, res);
   if (req.method === 'OPTIONS') return res.status(204).end();
 
+  const startedAt = Date.now();
+  const timeLeft = () => TIER_BUDGET_MS - (Date.now() - startedAt);
+
   const shortcode = extractShortcode(req.query.url);
   if (!shortcode) {
     res.setHeader('Cache-Control', 'no-store');
     return res.status(400).json({
-      error: 'Valid Instagram reel/post ka link bhejo',
+      error: 'Send a valid Instagram reel or post link',
       example: '/api/reel?url=https://www.instagram.com/reel/ABC123xyz/',
     });
   }
 
   const debug = req.query.debug === '1';
+  const shareToken = extractShareToken(req.query.url);
   const attempts = [];
 
   // --- Tier 0: reel page. Ise cookies chahiye hi NAHI, isliye sabse pehle
@@ -1021,6 +1176,22 @@ export default async function handler(req, res) {
     attempts.push({ tier: 'reel-page', ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
   }
 
+  // Saaf URL gira aur user ke link me share token tha — ek baar token ke saath.
+  // Age gate par ye chhod dete hain: test me saabit ho chuka hai ki token us
+  // deewar ko nahi kholta, to us par 2 second aur kharch karne ka koi matlab
+  // nahi.
+  if (!data && shareToken && !attempts.some((a) => a.ageRestricted) && timeLeft() >= MIN_TIER_MS) {
+    try {
+      const r = await fromReelPage(shortcode, FETCH_TIMEOUT, shareToken);
+      const { ok, data: d, ...diag } = r;
+      const { sample, htmlLength, ...safeDiag } = diag;
+      attempts.push({ tier: `reel-page+${shareToken.name}`, ok, ...(debug ? diag : safeDiag) });
+      if (ok) data = d;
+    } catch (e) {
+      attempts.push({ tier: `reel-page+${shareToken.name}`, ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
+    }
+  }
+
   // ⚠️ Kram soch-samajh kar hai:
   //   reel-page  — bina account. Zyadatar yahin kaam ho jaata hai.
   //   web-api    — www ka darwaza, session ke saath. igexport bhi yahi use karte hain.
@@ -1037,6 +1208,10 @@ export default async function handler(req, res) {
   /** Baaki tier — inhe cookies chahiye, isliye ye reel-page ke girne par hi chalte hain. */
   const runTiers = async () => {
     for (const [name, fn] of TIERS) {
+      if (timeLeft() < MIN_TIER_MS) {
+        attempts.push({ tier: name, ok: false, reason: `time budget spent (${timeLeft()}ms left), tier skipped` });
+        continue;
+      }
       try {
         const r = await fn(shortcode, jar);
         const { ok, data: d, ...diag } = r;
@@ -1071,8 +1246,8 @@ export default async function handler(req, res) {
   // sakta hai. Isliye agar saare tier fail hue AUR jar cache se aaya tha, to
   // ek baar taaza cookie lekar dobara koshish karo. Ye sirf tab chalta hai jab
   // pehle hi sab fail ho chuka ho — normal request par extra kharcha zero.
-  if (!data && cookieInfo?.cached) {
-    attempts.push({ tier: '(cookie refresh)', ok: false, reason: 'saare tier fail — taazi cookies leke dobara' });
+  if (!data && cookieInfo?.cached && timeLeft() >= MIN_TIER_MS) {
+    attempts.push({ tier: '(cookie refresh)', ok: false, reason: 'all tiers failed, retrying once with fresh cookies' });
     try {
       const c2 = await getJar(true);
       jar = c2.jar;
@@ -1084,10 +1259,14 @@ export default async function handler(req, res) {
   }
 
   if (data) {
+    lastSuccessAt = Date.now();
     if (debug) {
       // debug response cache hua to purana diagnostic data chipak jayega
       res.setHeader('Cache-Control', 'no-store');
-      return res.status(200).json({ ...addDownloadLinks(data), cookies: cookieInfo, attempts });
+      return res.status(200).json({
+        ...addDownloadLinks(data), cookies: cookieInfo, attempts,
+        tookMs: Date.now() - startedAt,
+      });
     }
     const ttl = cacheSeconds(data);
     res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
@@ -1104,7 +1283,30 @@ export default async function handler(req, res) {
   //                         karein to Instagram ko sirf 1 baar poocha jayega.
   //   Humari taraf dikkat -> 502, koi cache nahi. Session theek karte hi turant
   //                          sahi chalne lagega, cache clear karne ki zaroorat nahi.
-  const reelFault = Boolean(verdict.reelFault);
+  //
+  // Private reel yahan pehle 502 ban rahi thi. Wajah: bina session ke baaki
+  // tier `login_required` dete hain, aur diagnose() ka pehla check us shabd
+  // par jaan-bujh kar ruk jaata hai (kyunki login_required ka matlab hamara
+  // session marna bhi ho sakta hai). Nateeja: har private reel par 8 second
+  // ka intezaar, ek bekaar Apify call, aur user ko "service is busy" — jabki
+  // asli baat sirf itni thi ki woh reel private hai.
+  //
+  // Farak karne ka tareeka: agar isi instance ne abhi-abhi kisi aur reel ko
+  // theek serve kiya hai, to hamara IP aur session dono theek hain. Us haal
+  // me is reel ka na milna is reel ki apni baat hai, hamari nahi.
+  const couldBePost = POST_LIKELY_CODES.has(verdict.code);
+  const servedRecently = lastSuccessAt > 0 && (Date.now() - lastSuccessAt) < RECENT_SUCCESS_MS;
+
+  // Pehle muft wala check: isi instance ne abhi kuch serve kiya ho to probe
+  // ki zaroorat hi nahi. Warna control post maang kar dekho.
+  let healthy = servedRecently;
+  let how = servedRecently ? 'recent-success' : null;
+  if (!healthy && couldBePost && timeLeft() >= CONTROL_TIMEOUT_MS) {
+    healthy = await ipLooksHealthy();
+    how = healthy ? 'control-probe' : null;
+  }
+
+  const reelFault = Boolean(verdict.reelFault) || (healthy && couldBePost);
 
   if (debug) {
     res.setHeader('Cache-Control', 'no-store');
@@ -1115,10 +1317,17 @@ export default async function handler(req, res) {
   }
 
   return res.status( reelFault ? 404 : 502 ).json({
-    error: reelFault ? 'Ye reel fetch nahi ho sakti' : 'Reel fetch nahi ho paayi',
+    // Jahan hum pakke hain wahan seedha bata dete hain, warna aam jawab.
+    // Jhooth se bachne ke liye: "private ya deleted" tabhi likha jaata hai jab
+    // verdict wahi kehta ho, guess par nahi.
+    error: USER_ERROR[verdict.code]
+      || (reelFault ? 'This post could not be fetched' : 'Could not fetch this post right now'),
     diagnosis: verdict.code,
-    kya_hua: verdict.meaning,
+    whatHappened: verdict.meaning,
     shortcode,
+    blamedOn: reelFault ? (verdict.reelFault ? 'verdict' : how) : 'our-side',
+    shareToken: shareToken ? shareToken.name : null,
+    tookMs: Date.now() - startedAt,
     docIdUsed: DOC_ID,
     hadSessionId: Boolean(SESSIONID),
     cookies: cookieInfo,
