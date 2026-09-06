@@ -1,7 +1,12 @@
 // ============================================================
-//  Instagram Reel Downloader API  —  v9.6
+//  Instagram Reel Downloader API  —  v9.7
 //
-//  v9.6 me kya naya:
+//  v9.7: age gate milte hi baaki saare tier band. v9.6 ne verdict sahi diya
+//  tha par live par 5.7 second lag rahe the kyunki session tier, cookie
+//  refresh aur dobara koshish sab chalte rehte the — jabki jawab pehle hi
+//  tier me saaf tha. Ab wahi jawab ~1.5 second me.
+//
+//  v9.6 me kya aaya tha:
 //
 //  1. AGE GATE PEHCHANA JAATA HAI. Jo post age-restricted hai uska page 200 OK
 //     aur 650+ KB aata hai par media hata hua hota hai. Pehle ye "app shell"
@@ -1180,7 +1185,16 @@ export default async function handler(req, res) {
   // Age gate par ye chhod dete hain: test me saabit ho chuka hai ki token us
   // deewar ko nahi kholta, to us par 2 second aur kharch karne ka koi matlab
   // nahi.
-  if (!data && shareToken && !attempts.some((a) => a.ageRestricted) && timeLeft() >= MIN_TIER_MS) {
+  // v9.7 — jaise hi age gate dikha, sab kuch band.
+  //
+  // v9.6 ne verdict to sahi diya par baaki tier phir bhi chalte rahe: live par
+  // 5.7 second lage, jabki jawab pehle hi tier me saaf tha. Age gate ka matlab
+  // hai ki Instagram ne khud bataya ki media logged-in adult account ke bina
+  // milega hi nahi. Us haal me session tier, cookie refresh, dobara koshish —
+  // sab sirf waqt aur data kharch karte hain, nateeja wahi rehta hai.
+  const ageGate = () => attempts.some((a) => a.ageRestricted);
+
+  if (!data && shareToken && !ageGate() && timeLeft() >= MIN_TIER_MS) {
     try {
       const r = await fromReelPage(shortcode, FETCH_TIMEOUT, shareToken);
       const { ok, data: d, ...diag } = r;
@@ -1231,7 +1245,7 @@ export default async function handler(req, res) {
   };
 
   // reel-page gira — ab cookies lao aur baaki tier chalao
-  if (!data) {
+  if (!data && !ageGate()) {
     try {
       const c = await getJar();
       jar = c.jar;
@@ -1246,7 +1260,7 @@ export default async function handler(req, res) {
   // sakta hai. Isliye agar saare tier fail hue AUR jar cache se aaya tha, to
   // ek baar taaza cookie lekar dobara koshish karo. Ye sirf tab chalta hai jab
   // pehle hi sab fail ho chuka ho — normal request par extra kharcha zero.
-  if (!data && cookieInfo?.cached && timeLeft() >= MIN_TIER_MS) {
+  if (!data && !ageGate() && cookieInfo?.cached && timeLeft() >= MIN_TIER_MS) {
     attempts.push({ tier: '(cookie refresh)', ok: false, reason: 'all tiers failed, retrying once with fresh cookies' });
     try {
       const c2 = await getJar(true);
