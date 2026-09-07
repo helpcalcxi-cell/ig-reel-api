@@ -1,64 +1,48 @@
 // ============================================================
-//  PROBE v7  —  Aayush ke browser ke HUBAHU headers
+//  PROBE v8  —  ab tak ki sabse alag koshish
 //
-//  Ye probe andaze par nahi bana. Aayush ne apne Chrome ka
-//  "Copy as fetch" bheja aur usme ek cheez turant dikhi:
+//  v7 ke nateeje ne meri ek theory tod di aur ek nayi baat dikhai.
 //
-//      Uska browser :  sec-fetch-site: same-origin
-//      Mere probes  :  sec-fetch-site: none
+//  TOOTI THEORY: maine kaha tha ki "SecFetch Policy violation" isliye
+//  aa raha hai kyunki main mobile endpoint par browser wale sec-fetch
+//  headers bhej raha tha. Maine wo headers hata diye. Error phir bhi
+//  waisa ka waisa aaya. Yaani wo error hamare headers ki wajah se tha
+//  hi nahi. Meri theory galat thi.
 //
-//  `none` = user ne URL seedha type kiya.
-//  `same-origin` = instagram.com ke kisi page se navigate karke aaya.
+//  NAYI BAAT: profile page 200 deta hai, block nahi karta. 490 KB ka
+//  shell aata hai. Iska matlab Instagram mana nahi kar raha — wo bas
+//  data HTML me nahi bhejta. Browser me follower count ek ALAG request
+//  se aata hai jo shell ke JS chalne ke baad hoti hai:
 //
-//  Aur v5 me Instagram ne error me NAAM LEKAR bataya tha:
-//  "SecFetch Policy violation." Wo policy yahi dekh rahi thi, aur
-//  main har round me galat value bhej raha tha.
+//      POST https://www.instagram.com/graphql/query
 //
-//  Doosri galti: mera UA Chrome 131 bata raha tha, uska browser 152
-//  hai. 21 version purana client apne aap me ek bot signal hai.
+//  Aur wo request kaam karti hai kyunki browser shell ke andar se
+//  `lsd` token, `csrf`, `spin` values aur `doc_id` nikaal kar bhejta
+//  hai. Hum ye aaj tak ek baar bhi nahi kiya. reel.js me bhi doc_id
+//  hardcoded aur purana pada hai, shell se nikala hua nahi.
 //
-//  Aur ye headers bhi gayab the: priority, dpr, viewport-width,
-//  sec-ch-prefers-color-scheme, sec-ch-ua-model, aur accept me
-//  application/signed-exchange.
+//  Isliye v8 ek hi kaam karta hai, par dhang se: shell uthao, uske
+//  andar se browser wale saare tokens nikalo, aur wahi POST khud
+//  banakar bhejo.
 //
-//  Ab sab hubahu waisa hai. Cookies uski nahi li gayi — hum apni
-//  guest cookies khud banate hain.
-//
-//  ---------------------------------------------------------------
-//  Aur ek badi galti jo aaj pakdi gayi:
-//
-//  v5/v6 me main MOBILE endpoint (i.instagram.com) par bhi sec-fetch
-//  aur referer headers bhej raha tha. Android app ye bhejta hi nahi.
-//  Isi wajah se Instagram ne "SecFetch Policy violation" bola tha —
-//  main app hone ka daawa kar raha tha par browser ke kaagaz dikha
-//  raha tha. reel.js ka mobile tier sirf 6 headers bhejta hai aur
-//  roz chalta hai. Ab yahan bhi hubahu wahi 6 hain.
-//
-//  Do naye darwaze bhi khole gaye hain jo aaj tak try nahi hue:
-//    3b  wahi web_profile_info url, par Android UA ke saath
-//    3c  wahi endpoint i.instagram.com host par
-//  Ab tak maine hamesha browser UA + www ka combination try kiya tha,
-//  aur reel.js ki kamyabi thik iske ulte combination se aati hai.
+//  429 wali baat bhi note karne layak hai: teeno web_profile_info
+//  attempts par status 429 aur body ki lambai 0 thi. Khaali body ka
+//  matlab hai ki request app tak pahunchi hi nahi, edge par hi ruk
+//  gayi. Isliye usi endpoint ko chhedne ka ab koi fayda nahi. graphql
+//  ek alag endpoint hai aur uska limiter alag hota hai.
 //
 //  Chalao:
-//   /api/profile-test?u=natgeo&post=https://www.instagram.com/reel/DbdoGAQMg8O/
+//   /api/profile-test?u=natgeo
 // ============================================================
 
-const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const IG_APP_ID = '936619743392459';
-const SESSIONID = process.env.IG_SESSIONID || '';
-const T = 6000;              // per request
-const BUDGET = 24000;        // poore probe ka waqt
+const T = 7000;
+const BUDGET = 22000;
 
-// Chrome 152, bilkul uske browser jaisa
 const UA_WEB =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
-const UA_MOBILE =
-  'Instagram 302.0.0.23.114 Android (33/13; 420dpi; 1080x2400; ' +
-  'samsung; SM-G991B; o1s; exynos2100; en_US; 526face9)';
 
-/* Client hints ka poora set, uske Copy as fetch se hubahu */
 const CH = {
   'sec-ch-prefers-color-scheme': 'dark',
   'sec-ch-ua': '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
@@ -72,11 +56,7 @@ const CH = {
   'viewport-width': '663',
 };
 
-/**
- * Page navigation ke headers, uske browser jaise.
- * site = 'same-origin' hi asli badlaav hai. 'none' ab default nahi.
- */
-function pageHeaders(cookie, site = 'same-origin') {
+function pageHeaders(cookie, site = 'same-origin', referer) {
   const h = {
     accept:
       'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -91,81 +71,83 @@ function pageHeaders(cookie, site = 'same-origin') {
     'user-agent': UA_WEB,
     ...CH,
   };
-  // same-origin ka matlab hai kahin se navigate karke aaya, isliye
-  // referer bhi hona chahiye warna baat aapas me nahi milti
-  if (site === 'same-origin') h.referer = 'https://www.instagram.com/';
+  if (site === 'same-origin') h.referer = referer || 'https://www.instagram.com/';
   if (cookie) h.cookie = cookie;
   return h;
 }
 
-/**
- * Mobile aur web ke headers ALAG rakhne zaroori hain.
- *
- * v5 me Instagram ne साफ़ shabdon me kaha tha: "SecFetch Policy violation."
- * Wajah ye thi ki main mobile app ke endpoint par `sec-fetch-site`,
- * `sec-fetch-mode`, `sec-fetch-dest`, `priority` aur `referer` bhej raha
- * tha. Android app ye headers bhejta hi NAHI hai — ye sirf browser bhejta
- * hai. Yaani main app hone ka daawa kar raha tha par browser ke kaagaz
- * dikha raha tha, aur Instagram ne wahi pakda.
- *
- * reel.js ka mobile tier roz kaam karta hai aur wo bilkul ye chhe headers
- * bhejta hai, ek bhi zyada nahi. Yahan hubahu wahi rakha hai.
- */
-function apiHeaders(cookie, mobile) {
-  if (mobile) {
-    const h = {
-      'User-Agent': UA_MOBILE,
-      'X-IG-App-ID': IG_APP_ID,
-      'X-IG-Capabilities': '3brTvw==',
-      'X-IG-Connection-Type': 'WIFI',
-      'Accept-Language': 'en-US',
-      Accept: '*/*',
-    };
-    if (cookie) h.Cookie = cookie;
-    return h;                       // koi sec-fetch nahi, koi referer nahi
-  }
-  const h = {
-    'user-agent': UA_WEB,
-    accept: '*/*',
-    'accept-language': 'en-US,en;q=0.9',
-    'x-ig-app-id': IG_APP_ID,
-    'x-asbd-id': '129477',
-    'x-ig-www-claim': '0',
-    'x-requested-with': 'XMLHttpRequest',
-    ...CH,
-    'sec-fetch-site': 'same-origin',
-    'sec-fetch-mode': 'cors',
-    'sec-fetch-dest': 'empty',
-    priority: 'u=1, i',
-    referer: 'https://www.instagram.com/',
-  };
-  if (cookie) h.cookie = cookie;
-  return h;
-}
-
-function shortcodeToMediaId(sc) {
-  let id = 0n;
-  for (const ch of sc.slice(0, 11)) {
-    const i = ALPHABET.indexOf(ch);
-    if (i === -1) throw new Error('bad shortcode');
-    id = id * 64n + BigInt(i);
-  }
-  return id.toString();
-}
-function shortcodeOf(input) {
-  const s = String(input || '').trim();
-  if (/^[A-Za-z0-9_-]{5,30}$/.test(s) && !s.includes('/')) return s;
-  const m = s.match(/instagram\.com\/(?:[A-Za-z0-9._]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
+/* ---------------------------------------------------------------
+   Shell ke andar se wo sab nikalna jo browser graphql POST me
+   bhejta hai. Yahi is probe ka dil hai.
+   --------------------------------------------------------------- */
+function one(html, re) {
+  const m = html.match(re);
   return m ? m[1] : null;
 }
+function many(html, re, cap = 40) {
+  const out = [];
+  const r = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+  let m;
+  while ((m = r.exec(html)) !== null) {
+    if (!out.includes(m[1])) out.push(m[1]);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
 
-/* Apni guest cookies, uski nahi. Homepage ko bhi ab same headers se
-   maangte hain, warna pehli request par hi pakde jaate. */
+function extractTokens(html) {
+  return {
+    lsd:
+      one(html, /"LSD",\s*\[\s*\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/) ||
+      one(html, /name="lsd"\s+value="([^"]+)"/) ||
+      one(html, /"lsd"\s*:\s*"([^"]{6,})"/),
+    csrf: one(html, /"csrf_token"\s*:\s*"([^"]+)"/),
+    spinR: one(html, /"__spin_r"\s*:\s*(\d+)/) || one(html, /"server_revision"\s*:\s*(\d+)/),
+    spinT: one(html, /"__spin_t"\s*:\s*(\d+)/),
+    rev: one(html, /"rev"\s*:\s*(\d+)/) || one(html, /"consistency"\s*:\s*\{\s*"rev"\s*:\s*(\d+)/),
+    hsi: one(html, /"hsi"\s*:\s*"(\d+)"/),
+    hs: one(html, /"haste_session"\s*:\s*"([^"]+)"/),
+    appId: one(html, /"X-IG-App-ID"\s*:\s*"(\d+)"/) || one(html, /"APP_ID"\s*:\s*"(\d+)"/),
+    // Shell me kaunse doc_id aur kaunse query naam maujood hain
+    docIds: many(html, /"doc_id"\s*:\s*"?(\d{8,})/),
+    profileQueries: many(html, /(Polaris[A-Za-z]*Profile[A-Za-z]*Query)/),
+    anyQueries: many(html, /(Polaris[A-Za-z]{4,60}Query)/, 25),
+    userIdInShell:
+      one(html, /"profile_id"\s*:\s*"(\d+)"/) ||
+      one(html, /"owner_id"\s*:\s*"(\d+)"/) ||
+      one(html, /"user_id"\s*:\s*"(\d+)"/) ||
+      one(html, /"id"\s*:\s*"(\d{6,})"\s*,\s*"username"/),
+  };
+}
+
+/* jazoest = "2" + lsd ke har character ka char code jodo.
+   Facebook ka apna checksum hai, browser bhi yahi bhejta hai. */
+function jazoest(lsd) {
+  if (!lsd) return null;
+  let sum = 0;
+  for (let i = 0; i < lsd.length; i++) sum += lsd.charCodeAt(i);
+  return '2' + sum;
+}
+
+function grabFollowers(t) {
+  let m = t.match(/"follower_count"\s*:\s*(\d+)/);
+  if (m) return Number(m[1]);
+  m = t.match(/"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/);
+  if (m) return Number(m[1]);
+  return null;
+}
+function countLikes(t) {
+  const a = t.match(/"like_count"\s*:\s*\d+/g);
+  const b = t.match(/"edge_liked_by"\s*:\s*\{\s*"count"/g);
+  return Math.max(a ? a.length : 0, b ? b.length : 0);
+}
+
 async function guestCookie() {
   const jar = {};
+  let homeLen = 0;
   try {
     const r = await fetch('https://www.instagram.com/', {
-      headers: pageHeaders(null, 'none'),   // homepage par none hi sahi hai
+      headers: pageHeaders(null, 'none'),
       signal: AbortSignal.timeout(T),
     });
     for (const c of r.headers.getSetCookie?.() || []) {
@@ -174,56 +156,29 @@ async function guestCookie() {
       if (i > 0) jar[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
     }
     const html = await r.text();
+    homeLen = html.length;
     if (!jar.csrftoken) {
       const m = html.match(/"csrf_token"\s*:\s*"([^"]+)"/);
       if (m) jar.csrftoken = m[1];
     }
   } catch {}
-  return { jar, str: Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ') };
-}
-
-const MARKERS = ['follower_count', 'edge_followed_by', 'profile_pic_url', 'biography', 'media_count'];
-function grabFollowers(t) {
-  let m = t.match(/"follower_count"\s*:\s*(\d+)/);
-  if (m) return Number(m[1]);
-  m = t.match(/"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/);
-  if (m) return Number(m[1]);
-  m = t.match(/title="([\d,]{4,})"/);
-  if (m) return Number(m[1].replace(/,/g, ''));
-  return null;
-}
-function countLikes(t) {
-  const a = t.match(/"like_count"\s*:\s*\d+/g);
-  const b = t.match(/"edge_liked_by"\s*:\s*\{\s*"count"/g);
-  return Math.max(a ? a.length : 0, b ? b.length : 0);
-}
-function peek(t, n, pad = 110) {
-  const i = t.indexOf(n);
-  return i === -1 ? null : t.slice(Math.max(0, i - 25), i + n.length + pad);
-}
-function findDeep(o, key, d = 0) {
-  if (!o || typeof o !== 'object' || d > 8) return null;
-  if (o[key] != null && typeof o[key] !== 'object') return o[key];
-  for (const k of Object.keys(o)) {
-    const v = findDeep(o[k], key, d + 1);
-    if (v != null) return v;
-  }
-  return null;
+  return { jar, homeLen, str: Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ') };
 }
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
 
-  const u = String(req.query.u || '').trim().replace(/^@/, '');
-  const postCode = shortcodeOf(req.query.post);
-  if (!u && !postCode) {
-    return res.status(400).json({ error: 'Pass ?u=natgeo and optionally &post=<reel link>' });
+  const u = String(req.query.u || 'natgeo').trim().replace(/^@/, '');
+  if (!/^[A-Za-z0-9._]{1,30}$/.test(u)) {
+    return res.status(400).json({ error: 'Pass ?u=natgeo' });
   }
+  // Agar browser se asli doc_id mil jaye to yahan se pass kar sakte hain
+  const forcedDoc = String(req.query.doc || '').replace(/\D/g, '') || null;
 
   const startedAt = Date.now();
   const attempts = [];
-  let followers = null, pk = null, posts = 0;
+  let followers = null, posts = 0;
 
   const push = async (tier, fn) => {
     if (Date.now() - startedAt > BUDGET) { attempts.push({ tier, skipped: 'out of time' }); return; }
@@ -231,179 +186,164 @@ export default async function handler(req, res) {
     catch (e) { attempts.push({ tier, error: `${e.name}: ${e.message}` }); }
   };
 
-  const { jar, str: cookie } = await guestCookie();
+  const { jar, str: cookie, homeLen } = await guestCookie();
 
-  // === Tier 1: profile page, sec-fetch-site: same-origin ===
-  // Yahi wo ek badlaav hai jo pehle kabhi try nahi hua.
-  if (u) {
-    await push('1 page same-origin', async () => {
-      const r = await fetch(`https://www.instagram.com/${encodeURIComponent(u)}/`, {
-        headers: pageHeaders(cookie, 'same-origin'),
-        redirect: 'follow',
-        signal: AbortSignal.timeout(T),
-      });
-      const t = await r.text();
-      const f = grabFollowers(t), l = countLikes(t);
-      if (f != null && followers == null) followers = f;
-      if (l > posts) posts = l;
-      const mk = {};
-      for (const m of MARKERS) mk[m] = t.includes(m);
-      return { status: r.status, length: t.length, markers: mk, followers: f, likeCounts: l, peek: peek(t, 'follower_count') };
+  // === Step 1: shell uthao aur uske andar jhaanko ===
+  let tok = null, shellLen = 0;
+  await push('1 shell + token extract', async () => {
+    const r = await fetch(`https://www.instagram.com/${encodeURIComponent(u)}/`, {
+      headers: pageHeaders(cookie, 'same-origin'),
+      redirect: 'follow',
+      signal: AbortSignal.timeout(T),
     });
+    const t = await r.text();
+    shellLen = t.length;
+    tok = extractTokens(t);
+    const f = grabFollowers(t);
+    if (f != null) followers = f;
+    return {
+      status: r.status,
+      length: t.length,
+      followersInShell: f,
+      // Sabse zaroori jawab: shell me tokens mile ya nahi
+      found: {
+        lsd: Boolean(tok.lsd),
+        csrf: Boolean(tok.csrf),
+        spinR: Boolean(tok.spinR),
+        hsi: Boolean(tok.hsi),
+        docIdCount: tok.docIds.length,
+        profileQueryCount: tok.profileQueries.length,
+        userIdInShell: tok.userIdInShell,
+      },
+      docIds: tok.docIds.slice(0, 12),
+      profileQueries: tok.profileQueries.slice(0, 12),
+      anyQueries: tok.anyQueries.slice(0, 20),
+    };
+  });
 
-    // Purana wala bhi rakhte hain taki farak saaf dikhe
-    await push('2 page none (old way)', async () => {
-      const r = await fetch(`https://www.instagram.com/${encodeURIComponent(u)}/`, {
-        headers: pageHeaders(cookie, 'none'),
-        redirect: 'follow',
-        signal: AbortSignal.timeout(T),
-      });
-      const t = await r.text();
-      const f = grabFollowers(t);
-      if (f != null && followers == null) followers = f;
-      return { status: r.status, length: t.length, followers: f };
+  // === Step 2: wahi POST jo browser karta hai ===
+  // Ye aaj tak ek baar bhi try nahi hua. reel.js me bhi doc_id
+  // hardcoded pada hai, shell se nikala hua nahi.
+  const gqlCookie = [cookie, tok?.csrf ? `csrftoken=${tok.csrf}` : '']
+    .filter(Boolean).join('; ');
+
+  async function graphql(label, endpoint, docId, variables, friendly) {
+    const body = new URLSearchParams();
+    body.set('av', '0');
+    body.set('__d', 'www');
+    body.set('__user', '0');
+    body.set('__a', '1');
+    body.set('__req', '1');
+    body.set('dpr', '1');
+    body.set('__ccg', 'EXCELLENT');
+    if (tok?.hs) body.set('__hs', tok.hs);
+    if (tok?.spinR) { body.set('__rev', tok.spinR); body.set('__spin_r', tok.spinR); }
+    if (tok?.hsi) body.set('__hsi', tok.hsi);
+    body.set('__spin_b', 'trunk');
+    body.set('__spin_t', String(Math.floor(Date.now() / 1000)));
+    if (tok?.lsd) { body.set('lsd', tok.lsd); body.set('jazoest', jazoest(tok.lsd)); }
+    body.set('fb_api_caller_class', 'RelayModern');
+    if (friendly) body.set('fb_api_req_friendly_name', friendly);
+    body.set('variables', JSON.stringify(variables));
+    body.set('server_timestamps', 'true');
+    body.set('doc_id', docId);
+
+    const headers = {
+      accept: '*/*',
+      'accept-language': 'en-US,en;q=0.9',
+      'content-type': 'application/x-www-form-urlencoded',
+      origin: 'https://www.instagram.com',
+      referer: `https://www.instagram.com/${u}/`,
+      'user-agent': UA_WEB,
+      'x-ig-app-id': tok?.appId || IG_APP_ID,
+      'x-fb-lsd': tok?.lsd || '',
+      'x-csrftoken': tok?.csrf || jar.csrftoken || '',
+      'x-asbd-id': '129477',
+      'x-ig-www-claim': '0',
+      'x-fb-friendly-name': friendly || '',
+      'sec-fetch-site': 'same-origin',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-dest': 'empty',
+      priority: 'u=1, i',
+      ...CH,
+    };
+    if (gqlCookie) headers.cookie = gqlCookie;
+
+    const r = await fetch(endpoint, {
+      method: 'POST', headers, body: body.toString(),
+      signal: AbortSignal.timeout(T),
     });
+    const t = await r.text();
+    const f = grabFollowers(t);
+    const l = countLikes(t);
+    if (f != null && followers == null) followers = f;
+    if (l > posts) posts = l;
+    return {
+      status: r.status, length: t.length, followers: f, likeCounts: l,
+      sample: t.slice(0, 220),
+    };
   }
 
-  // === Tier 3: web API, ab poore Chrome 152 headers ke saath ===
-  if (u && followers == null) {
-    await push('3 web_profile_info', async () => {
-      const r = await fetch(
-        `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
-        { headers: { ...apiHeaders(cookie, false), referer: `https://www.instagram.com/${u}/`,
-                     ...(jar.csrftoken ? { 'x-csrftoken': jar.csrftoken } : {}) },
-          signal: AbortSignal.timeout(T) }
-      );
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch {}
-      const f = grabFollowers(t);
-      const p = findDeep(j, 'pk');
-      if (f != null && followers == null) followers = f;
-      if (p && !pk) pk = String(p);
-      return { status: r.status, length: t.length, followers: f, pk: p, sample: t.slice(0, 160) };
-    });
+  // Shell se nikle doc_id sabse pehle. Agar tum browser se asli
+  // doc_id de doge to wo &doc= se sabse upar aa jayega.
+  const candidates = [];
+  if (forcedDoc) candidates.push(forcedDoc);
+  for (const d of tok?.docIds || []) if (!candidates.includes(d)) candidates.push(d);
+
+  const vars = { username: u, relay_header: false, render_surface: 'PROFILE' };
+
+  for (let i = 0; i < Math.min(candidates.length, 4) && followers == null; i++) {
+    const d = candidates[i];
+    await push(`2.${i + 1} graphql/query doc_id ${d}`, () =>
+      graphql('gq', 'https://www.instagram.com/graphql/query', d, vars, 'PolarisProfilePageContentQuery'));
   }
 
-  /* === Tier 3b: WAHI url, par Android app ka UA ===
-     Ye sabse zaroori naya test hai. reel.js isliye chalta hai kyunki
-     wo Instagram ke MOBILE surface se baat karta hai. Maine aaj tak
-     web_profile_info ko sirf browser UA ke saath maanga tha aur 429
-     mila. Same url + mobile UA kabhi try hi nahi kiya. */
-  if (u && followers == null) {
-    await push('3b web_profile_info [mobile UA]', async () => {
-      const r = await fetch(
-        `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
-        { headers: apiHeaders(null, true), signal: AbortSignal.timeout(T) }
-      );
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch {}
-      const f = grabFollowers(t), p = findDeep(j, 'pk');
-      if (f != null && followers == null) followers = f;
-      if (p && !pk) pk = String(p);
-      const l = countLikes(t);
-      if (l > posts) posts = l;
-      return { status: r.status, length: t.length, followers: f, pk: p, likeCounts: l, sample: t.slice(0, 160) };
-    });
+  // Doosra endpoint. Instagram dono chalata hai aur inke limiter alag hain.
+  if (followers == null && candidates.length) {
+    await push(`3 api/graphql doc_id ${candidates[0]}`, () =>
+      graphql('gq2', 'https://www.instagram.com/api/graphql', candidates[0], vars, 'PolarisProfilePageContentQuery'));
   }
 
-  /* === Tier 3c: wahi endpoint par i.instagram.com host se ===
-     www aur i. do alag gateways hain. i. par ab tak sirf usernameinfo
-     try hua tha. web_profile_info kabhi nahi. */
-  if (u && followers == null) {
-    await push('3c web_profile_info [i.instagram.com]', async () => {
-      const r = await fetch(
-        `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
-        { headers: apiHeaders(null, true), signal: AbortSignal.timeout(T) }
-      );
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch {}
-      const f = grabFollowers(t), p = findDeep(j, 'pk');
-      if (f != null && followers == null) followers = f;
-      if (p && !pk) pk = String(p);
-      const l = countLikes(t);
-      if (l > posts) posts = l;
-      return { status: r.status, length: t.length, followers: f, pk: p, likeCounts: l, sample: t.slice(0, 160) };
-    });
-  }
-
-  // === Tier 4: usernameinfo, mobile UA. v5 me yahin SecFetch error aaya tha ===
-  if (u && followers == null) {
-    await push('4 usernameinfo', async () => {
-      const r = await fetch(`https://i.instagram.com/api/v1/users/${encodeURIComponent(u)}/usernameinfo/`, {
-        headers: apiHeaders(null, true), signal: AbortSignal.timeout(T),
-      });
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch {}
-      const f = grabFollowers(t), p = findDeep(j, 'pk');
-      if (f != null && followers == null) followers = f;
-      if (p && !pk) pk = String(p);
-      return { status: r.status, length: t.length, followers: f, pk: p, sample: t.slice(0, 160) };
-    });
-  }
-
-  // === Tier 5: post se pk. BINA sessionid, kyunki wo mari hui hai
-  //     aur v5 me usi ne 403 logout_reason 8 diya tha ===
-  if (postCode && !pk) {
-    const mid = shortcodeToMediaId(postCode);
-    await push('5 post -> pk [no session]', async () => {
-      const r = await fetch(`https://i.instagram.com/api/v1/media/${mid}/info/`, {
-        headers: apiHeaders(null, true), signal: AbortSignal.timeout(T),
-      });
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch {}
-      const p = findDeep(j?.items?.[0]?.user || j, 'pk');
-      const f = grabFollowers(t);
-      if (p && !pk) pk = String(p);
-      if (f != null && followers == null) followers = f;
-      return { status: r.status, length: t.length, pk: p, followers: f, sample: t.slice(0, 160) };
-    });
-  }
-
-  // === Tier 6: pk se recent posts ===
-  if (pk) {
-    await push('6 feed/user/{pk}', async () => {
-      const r = await fetch(`https://i.instagram.com/api/v1/feed/user/${pk}/?count=12`, {
-        headers: apiHeaders(null, true), signal: AbortSignal.timeout(T),
-      });
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch {}
-      const items = (j?.items || []).map((x) => ({
-        code: x.code, likes: x.like_count, comments: x.comment_count, takenAt: x.taken_at,
-      })).filter((x) => x.likes != null);
-      if (items.length) posts = items.length;
-      return { status: r.status, length: t.length, postsReturned: items.length,
-               firstThree: items.slice(0, 3), sample: items.length ? null : t.slice(0, 160) };
-    });
-    if (followers == null) {
-      await push('7 users/{pk}/info', async () => {
-        const r = await fetch(`https://i.instagram.com/api/v1/users/${pk}/info/`, {
-          headers: apiHeaders(null, true), signal: AbortSignal.timeout(T),
-        });
-        const t = await r.text();
-        const f = grabFollowers(t);
-        if (f != null) followers = f;
-        return { status: r.status, length: t.length, followers: f, sample: t.slice(0, 160) };
-      });
-    }
-  }
-
-  const ok = followers != null && posts >= 3;
-  const sameOrigin = attempts.find((a) => a.tier.startsWith('1 '));
-  const none = attempts.find((a) => a.tier.startsWith('2 '));
+  // === Step 4: sirf ye dekhne ke liye ki 429 abhi bhi edge par hai ===
+  await push('4 web_profile_info (sirf tulna ke liye)', async () => {
+    const r = await fetch(
+      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
+      { headers: {
+          'user-agent': UA_WEB, accept: '*/*', 'x-ig-app-id': IG_APP_ID,
+          referer: `https://www.instagram.com/${u}/`,
+          'sec-fetch-site': 'same-origin', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty',
+          ...(gqlCookie ? { cookie: gqlCookie } : {}),
+        },
+        signal: AbortSignal.timeout(T) }
+    );
+    const t = await r.text();
+    const f = grabFollowers(t);
+    if (f != null && followers == null) followers = f;
+    return {
+      status: r.status, length: t.length, followers: f,
+      // khaali body = edge par ruka. bhari body = app tak pahuncha.
+      blockedAtEdge: r.status === 429 && t.length === 0,
+      sample: t.slice(0, 160),
+    };
+  });
 
   return res.status(200).json({
-    verdict: ok ? 'BUILDABLE — followers and post counts both came through'
-      : followers != null ? 'PARTIAL — followers yes, posts no'
-      : posts ? 'PARTIAL — posts yes, followers no'
+    verdict:
+      followers != null && posts >= 3 ? 'BUILDABLE — followers aur post counts dono mile'
+      : followers != null ? 'PARTIAL — followers mile, posts nahi'
       : 'still nothing',
-    // Yahi is round ka asli sawaal hai
-    secFetchMadeADifference:
-      sameOrigin && none
-        ? (sameOrigin.length || 0) !== (none.length || 0) || Boolean(sameOrigin.followers) !== Boolean(none.followers)
-        : null,
-    followers, pk, postsFound: posts,
+    followers,
+    postsFound: posts,
+    // Agar ye false hai to shell se token nikalna hi fail hai aur
+    // mujhe browser se asli graphql request chahiye.
+    tokensExtracted: tok
+      ? { lsd: Boolean(tok.lsd), csrf: Boolean(tok.csrf), spinR: tok.spinR, hsi: tok.hsi,
+          docIdsFound: tok.docIds.length }
+      : null,
+    homepageLength: homeLen,
+    shellLength: shellLen,
     cookiesCollected: Object.keys(jar),
-    hadSessionId: Boolean(SESSIONID),
+    hasDatr: Object.keys(jar).includes('datr'),
     tookMs: Date.now() - startedAt,
     attempts,
   });
