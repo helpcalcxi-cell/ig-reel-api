@@ -1,48 +1,50 @@
 // ============================================================
-//  PROBE v5  —  MOBILE API SURFACE
+//  PROBE v6  —  do asli errors theek karke
 //
-//  v1 se v4 tak meri galti ek hi thi: maine chaar baar WEB surface
-//  test kiya. Vercel ka web page, Vercel ka web API, Cloudflare ka
-//  web page. Sab ek hi darwaza.
+//  v5 ne pehli baar kaam ki baat batayi:
 //
-//  reel.js me ek DOOSRA surface hai jo Vercel se KAAM KARTA HAI:
+//    A usernameinfo  ->  400  "SecFetch Policy violation."
+//    C media info    ->  403  logout_reason: 8
 //
-//      i.instagram.com/api/v1/media/{id}/info/
-//      User-Agent: Instagram Android app
-//      X-IG-Capabilities: 3brTvw==
+//  Dono IP block NAHI hain. Dono theek ho sakte hain.
 //
-//  Ye Android app ka API hai. Mere profile probes ne i.instagram.com
-//  par bhi WEB ka User-Agent bheja, jo turant pakda jaata hai.
+//  1. SecFetch Policy violation
+//     Mere mobileHeaders() me ek bhi Sec-Fetch-* header nahi tha.
+//     Instagram ke kuch endpoints ise sakhti se check karte hain.
+//     Ab teeno bhejte hain.
 //
-//  Us surface par profile ke apne endpoints hain:
-//      /users/{username}/usernameinfo/    follower_count
-//      /users/{pk}/info/                  wahi, numeric id se
-//      /feed/user/{pk}/?count=12          recent posts, likes+comments
+//  2. logout_reason: 8
+//     Ye MARI HUI sessionid ki wajah se hai. Probe ne Cookie me
+//     sessionid bheja kyunki IG_SESSIONID abhi Vercel me set hai.
+//     Wo sessionid dead hai, aur usse request TOOT jaati hai —
+//     bina uske shayad chal jaati.
 //
-//  Aur pk hume POST se mil sakta hai, aur post fetch pehle se chalta
-//  hai. Yani chain ka pehla kadam already proven hai.
+//     Isliye ab har tier DO baar chalta hai: bina session, aur
+//     session ke saath. Nateeja saaf dikha dega ki wo madad kar
+//     rahi hai ya nuksaan.
 //
 //  Chalao:
-//    /api/profile-test?u=natgeo
-//    /api/profile-test?u=natgeo&post=https://www.instagram.com/reel/XXXX/
-//
-//  Doosra wala zyada taakatwar hai: wo post se pk nikaal kar feed
-//  endpoint tak pahunchta hai, bina username lookup par bharosa kiye.
+//    /api/profile-test?u=natgeo&post=https://www.instagram.com/reel/DbdoGAQMg8O/
 // ============================================================
 
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const IG_APP_ID = '936619743392459';
 
-// Wahi UA jo reel.js ka chalta hua mobile tier use karta hai
 const UA_MOBILE =
   'Instagram 302.0.0.23.114 Android (33/13; 420dpi; 1080x2400; ' +
   'samsung; SM-G991B; o1s; exynos2100; en_US; 526face9)';
+const UA_WEB =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 const SESSIONID = process.env.IG_SESSIONID || '';
 const T = 8000;
 
-/** reel.js ke chalte hue tier jaise hi headers */
-function mobileHeaders() {
+/**
+ * withSession = false hone par sessionid BILKUL nahi jaati.
+ * Yahi v5 ki asli galti thi.
+ */
+function mobileHeaders(withSession) {
   const h = {
     'User-Agent': UA_MOBILE,
     'X-IG-App-ID': IG_APP_ID,
@@ -50,14 +52,37 @@ function mobileHeaders() {
     'X-IG-Connection-Type': 'WIFI',
     'Accept-Language': 'en-US',
     Accept: '*/*',
+    // v5 me ye teeno gayab the. "SecFetch Policy violation." isi ka
+    // jawab tha. App apne API call ko same-origin XHR jaisa bhejta hai.
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
   };
-  if (SESSIONID) h.Cookie = `sessionid=${SESSIONID}`;
+  if (withSession && SESSIONID) h.Cookie = `sessionid=${SESSIONID}`;
   return h;
 }
 
-function shortcodeToMediaId(shortcode) {
+function webApiHeaders(withSession, ref) {
+  const h = {
+    'User-Agent': UA_WEB,
+    Accept: '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'x-ig-app-id': IG_APP_ID,
+    'x-asbd-id': '129477',
+    'x-ig-www-claim': '0',
+    'x-requested-with': 'XMLHttpRequest',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    Referer: ref,
+  };
+  if (withSession && SESSIONID) h.Cookie = `sessionid=${SESSIONID}`;
+  return h;
+}
+
+function shortcodeToMediaId(sc) {
   let id = 0n;
-  for (const ch of shortcode.slice(0, 11)) {
+  for (const ch of sc.slice(0, 11)) {
     const i = ALPHABET.indexOf(ch);
     if (i === -1) throw new Error('bad shortcode');
     id = id * 64n + BigInt(i);
@@ -71,15 +96,14 @@ function shortcodeOf(input) {
   return m ? m[1] : null;
 }
 
-async function getJson(url) {
-  const r = await fetch(url, { headers: mobileHeaders(), signal: AbortSignal.timeout(T) });
+async function call(url, headers) {
+  const r = await fetch(url, { headers, signal: AbortSignal.timeout(T) });
   const text = await r.text();
-  let json = null, parseErr = null;
-  try { json = JSON.parse(text); } catch (e) { parseErr = 'not JSON'; }
-  return { status: r.status, length: text.length, json, parseErr, sample: text.slice(0, 220) };
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { status: r.status, length: text.length, json, sample: text.slice(0, 180) };
 }
 
-/** Kisi bhi gehraai me follower count dhoondho */
 function findFollowers(o, d = 0) {
   if (!o || typeof o !== 'object' || d > 8) return null;
   if (typeof o.follower_count === 'number') return o.follower_count;
@@ -98,9 +122,8 @@ function findPk(o, d = 0) {
   }
   return null;
 }
-/** feed response se posts nikaalo — yahi engagement rate ki jaan hai */
 function itemsOf(json) {
-  const arr = json?.items || json?.feed_items || [];
+  const arr = json?.items || [];
   return arr.map((x) => {
     const n = x.media_or_ad || x.media || x;
     return {
@@ -109,7 +132,6 @@ function itemsOf(json) {
       comments: n.comment_count ?? null,
       plays: n.play_count ?? n.view_count ?? null,
       takenAt: n.taken_at ?? null,
-      isVideo: n.media_type === 2,
     };
   }).filter((p) => p.likes != null || p.comments != null);
 }
@@ -133,87 +155,102 @@ export default async function handler(req, res) {
     catch (e) { attempts.push({ tier, error: `${e.name}: ${e.message}` }); }
   };
 
-  // --- A: username se seedha profile info (Android app ka apna endpoint)
-  if (u) {
-    await push('A usernameinfo', async () => {
-      const r = await getJson(`https://i.instagram.com/api/v1/users/${encodeURIComponent(u)}/usernameinfo/`);
+  /* Har call do baar: bina session, phir session ke saath. Isse
+     saaf pata chalega ki mari hui sessionid madad kar rahi hai ya
+     request tod rahi hai. */
+  const both = async (label, url, headerFn) => {
+    await push(`${label} [no session]`, async () => {
+      const r = await call(url, headerFn(false));
       const f = findFollowers(r.json), p = findPk(r.json);
-      if (f != null) followers = f;
-      if (p) pk = p;
-      return { status: r.status, length: r.length, followers: f, pk: p, sample: r.sample };
-    });
-  }
-
-  // --- B: wahi cheez web_profile_info se, par MOBILE UA ke saath
-  if (u && followers == null) {
-    await push('B web_profile_info + mobile UA', async () => {
-      const r = await getJson(`https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`);
-      const f = findFollowers(r.json), p = findPk(r.json);
-      if (f != null) followers = f;
-      if (p) pk = p;
-      return { status: r.status, length: r.length, followers: f, pk: p, sample: r.sample };
-    });
-  }
-
-  // --- C: post se pk nikaalo. YE RASTA PEHLE SE CHALTA HAI.
-  //        reel.js ka mobile tier bilkul yahi call karta hai.
-  if (postCode && !pk) {
-    await push('C pk from post', async () => {
-      const mediaId = shortcodeToMediaId(postCode);
-      const r = await getJson(`https://i.instagram.com/api/v1/media/${mediaId}/info/`);
-      const p = findPk(r.json), f = findFollowers(r.json);
-      if (p) pk = p;
       if (f != null && followers == null) followers = f;
-      return {
-        status: r.status, length: r.length, pk: p, followers: f,
-        // Post ke apne numbers bhi dekh lete hain
-        postLikes: r.json?.items?.[0]?.like_count ?? null,
-        postComments: r.json?.items?.[0]?.comment_count ?? null,
-        sample: r.sample,
-      };
+      if (p && !pk) pk = p;
+      return { status: r.status, length: r.length, followers: f, pk: p, sample: r.sample };
     });
+    if (SESSIONID) {
+      await push(`${label} [with session]`, async () => {
+        const r = await call(url, headerFn(true));
+        const f = findFollowers(r.json), p = findPk(r.json);
+        if (f != null && followers == null) followers = f;
+        if (p && !pk) pk = p;
+        return { status: r.status, length: r.length, followers: f, pk: p, sample: r.sample };
+      });
+    }
+  };
+
+  // --- A: usernameinfo. v5 me yahan "SecFetch Policy violation." aaya tha.
+  if (u) {
+    await both(
+      'A usernameinfo',
+      `https://i.instagram.com/api/v1/users/${encodeURIComponent(u)}/usernameinfo/`,
+      (s) => mobileHeaders(s)
+    );
   }
 
-  // --- D: pk mil gaya to profile info
+  // --- B: wahi cheez web API se, ab Sec-Fetch ke saath
+  if (u && followers == null) {
+    await both(
+      'B web_profile_info',
+      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
+      (s) => webApiHeaders(s, `https://www.instagram.com/${u}/`)
+    );
+  }
+
+  // --- C: post se pk. v5 me yahan 403 logout_reason 8 aaya tha,
+  //        yaani MARI HUI SESSIONID ne request todi thi.
+  if (postCode && !pk) {
+    const mediaId = shortcodeToMediaId(postCode);
+    await both(
+      'C pk from post',
+      `https://i.instagram.com/api/v1/media/${mediaId}/info/`,
+      (s) => mobileHeaders(s)
+    );
+  }
+
+  // --- D: pk se profile info
   if (pk && followers == null) {
-    await push('D users/{pk}/info', async () => {
-      const r = await getJson(`https://i.instagram.com/api/v1/users/${pk}/info/`);
-      const f = findFollowers(r.json);
-      if (f != null) followers = f;
-      return { status: r.status, length: r.length, followers: f, sample: r.sample };
-    });
+    await both('D users/{pk}/info', `https://i.instagram.com/api/v1/users/${pk}/info/`, (s) => mobileHeaders(s));
   }
 
-  // --- E: SABSE ZAROORI. pk se recent posts, likes aur comments ke saath.
-  //        Engagement rate ke liye yahi chahiye.
+  // --- E: pk se recent posts. Engagement rate ki asli jaan.
   if (pk) {
-    await push('E feed/user/{pk}', async () => {
-      const r = await getJson(`https://i.instagram.com/api/v1/feed/user/${pk}/?count=12`);
+    await push('E feed/user/{pk} [no session]', async () => {
+      const r = await call(`https://i.instagram.com/api/v1/feed/user/${pk}/?count=12`, mobileHeaders(false));
       const list = itemsOf(r.json);
       if (list.length) posts = list;
-      return {
-        status: r.status, length: r.length,
-        postsReturned: list.length,
-        firstThree: list.slice(0, 3),
-        sample: list.length ? null : r.sample,
-      };
+      return { status: r.status, length: r.length, postsReturned: list.length, firstThree: list.slice(0, 3), sample: list.length ? null : r.sample };
     });
+    if (!posts.length && SESSIONID) {
+      await push('E feed/user/{pk} [with session]', async () => {
+        const r = await call(`https://i.instagram.com/api/v1/feed/user/${pk}/?count=12`, mobileHeaders(true));
+        const list = itemsOf(r.json);
+        if (list.length) posts = list;
+        return { status: r.status, length: r.length, postsReturned: list.length, firstThree: list.slice(0, 3), sample: list.length ? null : r.sample };
+      });
+    }
   }
 
-  const haveEnough = followers != null && posts.length >= 3;
+  const ok = followers != null && posts.length >= 3;
+
+  /* Sessionid madad kar rahi hai ya nuksaan — seedha jawab */
+  let sessionVerdict = 'not set';
+  if (SESSIONID) {
+    const noSess = attempts.filter((a) => a.tier.includes('[no session]') && a.status && a.status < 400).length;
+    const withSess = attempts.filter((a) => a.tier.includes('[with session]') && a.status && a.status < 400).length;
+    sessionVerdict = withSess > noSess ? 'helping'
+      : noSess > withSess ? 'HURTING — remove IG_SESSIONID from Vercel'
+      : 'no difference';
+  }
 
   return res.status(200).json({
-    verdict: haveEnough
-      ? 'BUILDABLE — followers and post counts both came through on the mobile API'
-      : followers != null
-        ? 'PARTIAL — followers came through but the post feed did not'
-        : posts.length
-          ? 'PARTIAL — post feed came through but follower count did not'
-          : 'mobile API gave nothing either',
+    verdict: ok
+      ? 'BUILDABLE — followers and post counts both came through'
+      : followers != null ? 'PARTIAL — followers yes, post feed no'
+      : posts.length ? 'PARTIAL — post feed yes, followers no'
+      : 'still nothing',
     followers,
     pk,
     postsFound: posts.length,
-    hadSessionId: Boolean(SESSIONID),
+    sessionidVerdict: sessionVerdict,
     username: u || null,
     tookMs: Date.now() - startedAt,
     attempts,
