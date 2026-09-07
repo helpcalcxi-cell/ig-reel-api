@@ -1,158 +1,207 @@
 // ============================================================
-//  PROFILE PROBE v2  —  api/profile-test.js
+//  PROBE v4  —  api/profile-test.js
 //
-//  v1 me MERI GALTI thi. Usne sirf purane GraphQL field naam
-//  dhoondhe the:
-//      edge_followed_by
-//      edge_owner_to_timeline_media
-//  Par Aayush ke browser ko jo HTML mila usme naam `follower_count`
-//  hai — naya shape. Isliye v1 ne "data nahi hai" bol diya jabki
-//  data ho bhi sakta tha.
+//  v2 ne jaldi haar maan li thi. Uski do kamiyan thin:
 //
-//  v2 kisi ek naam par bharosa nahi karta. Wo:
-//    1. Dono shapes ke SAARE markers dhoondhta hai
-//    2. Jo mile uska aas paas ka tukda wapas bhejta hai, taki hum
-//       apni aankh se dekh sakein ki page me kya hai
-//    3. Number nikaalne ki koshish har shape se karta hai
-//    4. Profile page ko cookies ke SAATH bhi maangta hai, kyunki
-//       browser ke paas hamesha csrftoken/mid/ig_did hote hain aur
-//       v1 ne bina cookie ke maanga tha
+//  1. Cookie bootstrap kamzor tha. Usne sirf csrftoken aur mid
+//     uthaayi. Browser ke paas `datr` aur `ig_did` BHI hote hain,
+//     aur wahi Instagram ke device identity cookies hain jinka
+//     logged-out gating me sabse bada role hota hai.
 //
-//  Deploy: repo me api/profile-test.js par (v1 ko overwrite kar do)
+//  2. Usne sirf profile page HTML try kiya. Browser ke DevTools me
+//     saaf dikhta hai ki data GraphQL aur doosre endpoints se bhi
+//     aata hai. Wo raaste chhue hi nahi gaye.
+//
+//  Ek baat jo yaad rakhni hai: POST page Vercel se theek chalta hai.
+//  Agar Instagram is IP ko bot maanta, to wo bhi fail hota. Yani
+//  masla poore IP ka nahi, sirf is ek route ki policy ka hai.
+//
+//  Paanch raaste, poore browser jaise headers ke saath:
+//    A  profile page   (poori cookies)
+//    B  ?__a=1&__d=dis (purana JSON variant)
+//    C  web_profile_info  www.instagram.com par
+//    D  web_profile_info  i.instagram.com par (alag host)
+//    E  GraphQL POST      (doc_id tum DevTools se doge)
+//
 //  Chalao : /api/profile-test?u=natgeo
-//  Kaam khatam hote hi ISE DELETE karna.
+//  GraphQL bhi try karne ke liye:
+//           /api/profile-test?u=natgeo&doc_id=<DevTools wala number>
 // ============================================================
 
-const UA_WEB =
+const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+const IG_APP_ID = '936619743392459';
+const ASBD_ID = '129477';
 const SESSIONID = process.env.IG_SESSIONID || '';
-const TIMEOUT = 8000;
+const T = 8000;
 
-/* Har wo marker jo profile data ke hone ka ishara deta hai.
-   Dono shapes, aur route ka naam bhi — kyunki
-   PolarisLoggedOutDesktopWWWProfileRoute ka matlab hai ki Instagram
-   ne ASLI logged-out profile route serve kiya, koi aam shell nahi. */
-const MARKERS = [
-  'follower_count',
-  'edge_followed_by',
-  'edge_owner_to_timeline_media',
-  'xdt_api__v1__feed__user_timeline_graphql_connection',
-  'PolarisProfilePageContent',
-  'LoggedOutDesktopWWWProfileRoute',
-  'profile_pic_url',
-  'biography',
-  'is_private',
-  'media_count',
-];
-
-/** Marker ke aas paas ka tukda — apni aankh se dekhne ke liye */
-function peek(html, needle, pad = 90) {
-  const i = html.indexOf(needle);
-  if (i === -1) return null;
-  return html.slice(Math.max(0, i - 20), Math.min(html.length, i + needle.length + pad));
+/* Browser jo bhejta hai, lagbhag wahi. v2 me client hints adhoore the. */
+function browserHeaders(extra = {}) {
+  return {
+    'User-Agent': UA,
+    'Accept-Language': 'en-US,en;q=0.9',
+    'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-ch-ua-platform-version': '"15.0.0"',
+    'sec-ch-ua-full-version-list':
+      '"Chromium";v="131.0.6778.86", "Not_A Brand";v="24.0.0.0", "Google Chrome";v="131.0.6778.86"',
+    ...extra,
+  };
 }
 
-/** Follower count har shape se nikaalne ki koshish */
-function grabFollowers(html) {
-  let m;
-  m = html.match(/"follower_count"\s*:\s*(\d+)/);
-  if (m) return { value: Number(m[1]), via: 'follower_count' };
-  m = html.match(/"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/);
-  if (m) return { value: Number(m[1]), via: 'edge_followed_by' };
-  m = html.match(/title="([\d,]{4,})"[^>]*>\s*[\d.]+[KMB]?\s*<\/span>/);
-  if (m) return { value: Number(m[1].replace(/,/g, '')), via: 'title attribute' };
-  m = html.match(/content="([\d.,]+[KMB]?) Followers/i);
-  if (m) return { value: m[1], via: 'og:description' };
+/* ---- follower count har shape se ---- */
+const FOLLOWER_RE = [
+  ['follower_count', /"follower_count"\s*:\s*(\d+)/],
+  ['edge_followed_by', /"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/],
+  ['followers_count', /"followers_count"\s*:\s*(\d+)/],
+];
+function grabFollowers(text) {
+  for (const [name, re] of FOLLOWER_RE) {
+    const m = text.match(re);
+    if (m) return { field: name, value: Number(m[1]) };
+  }
   return null;
 }
-
-/** Posts ke likes/comments kis bhi shape me — engagement rate ke liye ye zaroori hai */
-function grabPostCounts(html) {
-  const likeKeys = [
-    /"edge_liked_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/g,
-    /"edge_media_preview_like"\s*:\s*\{\s*"count"\s*:\s*(\d+)/g,
-    /"like_count"\s*:\s*(\d+)/g,
-  ];
-  const commentKeys = [
-    /"edge_media_to_comment"\s*:\s*\{\s*"count"\s*:\s*(\d+)/g,
-    /"comment_count"\s*:\s*(\d+)/g,
-  ];
-  const count = (list) => {
-    for (const re of list) {
-      const m = html.match(re);
-      if (m && m.length) return { n: m.length, via: String(re).slice(0, 40), first: m.slice(0, 3) };
-    }
-    return { n: 0, via: null, first: [] };
+function countMatches(text, re) {
+  const all = text.match(new RegExp(re.source, 'g'));
+  return all ? all.length : 0;
+}
+function grabPosts(text) {
+  return {
+    likes: Math.max(
+      countMatches(text, /"like_count"\s*:\s*\d+/),
+      countMatches(text, /"edge_liked_by"\s*:\s*\{\s*"count"/)
+    ),
+    comments: Math.max(
+      countMatches(text, /"comment_count"\s*:\s*\d+/),
+      countMatches(text, /"edge_media_to_comment"\s*:\s*\{\s*"count"/)
+    ),
   };
-  return { likes: count(likeKeys), comments: count(commentKeys) };
+}
+function peek(text, needle, pad = 110) {
+  const i = text.indexOf(needle);
+  if (i === -1) return null;
+  return text.slice(Math.max(0, i - 25), Math.min(text.length, i + needle.length + pad));
+}
+function verdictFor(text) {
+  const f = grabFollowers(text);
+  const p = grabPosts(text);
+  return { followers: f, posts: p, usable: Boolean(f) && p.likes >= 3 };
 }
 
-async function guestJar() {
-  const res = await fetch('https://www.instagram.com/', {
-    signal: AbortSignal.timeout(TIMEOUT),
-    headers: { 'User-Agent': UA_WEB, 'Accept-Language': 'en-US,en;q=0.9' },
-  });
+/* ---------------------------------------------------------- cookies
+   v2 ne sirf ek homepage GET kiya tha aur do cookies mili thin.
+   Browser ko `datr` aur `ig_did` bhi milte hain, isliye do jagah se
+   uthate hain aur jo mile sab jodte hain. */
+async function bigJar() {
   const jar = {};
-  for (const c of res.headers.getSetCookie?.() || []) {
-    const [pair] = c.split(';');
-    const i = pair.indexOf('=');
-    if (i > 0) jar[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
-  }
+  const grab = async (url) => {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(T), headers: browserHeaders({
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none',
+      }) });
+      for (const c of r.headers.getSetCookie?.() || []) {
+        const [pair] = c.split(';');
+        const i = pair.indexOf('=');
+        if (i > 0) jar[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
+      }
+      // kabhi kabhi ig_did sirf HTML ke andar milta hai
+      const html = await r.text();
+      if (!jar.ig_did) {
+        const m = html.match(/"device_id"\s*:\s*"([A-F0-9-]{36})"/i);
+        if (m) jar.ig_did = m[1];
+      }
+      if (!jar.csrftoken) {
+        const m = html.match(/"csrf_token"\s*:\s*"([^"]+)"/);
+        if (m) jar.csrftoken = m[1];
+      }
+    } catch { /* ek jagah fail ho to doosri se chal jayega */ }
+  };
+  await grab('https://www.instagram.com/');
+  if (!jar.datr || !jar.ig_did) await grab('https://www.instagram.com/accounts/login/');
   return jar;
 }
 const cookieStr = (jar) => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 
-/** Profile page maango. cookieHeader null ho to bilkul cookie ke bina. */
-async function fetchProfilePage(u, cookieHeader) {
-  const headers = {
-    'User-Agent': UA_WEB,
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Upgrade-Insecure-Requests': '1',
-    'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'none',
-    'sec-fetch-user': '?1',
-  };
-  if (cookieHeader) headers.Cookie = cookieHeader;
-
-  const res = await fetch(`https://www.instagram.com/${encodeURIComponent(u)}/`, {
-    signal: AbortSignal.timeout(TIMEOUT),
+/* ---------------------------------------------------------- tiers */
+async function tierPage(u, jar, qs = '') {
+  const r = await fetch(`https://www.instagram.com/${encodeURIComponent(u)}/${qs}`, {
+    signal: AbortSignal.timeout(T),
     redirect: 'follow',
-    headers,
+    headers: browserHeaders({
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Upgrade-Insecure-Requests': '1',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      ...(jar ? { Cookie: cookieStr(jar) } : {}),
+    }),
   });
-  const html = await res.text();
-
-  const found = {};
-  for (const mk of MARKERS) found[mk] = html.includes(mk);
-
-  const followers = grabFollowers(html);
-  const posts = grabPostCounts(html);
-
-  return {
-    status: res.status,
-    htmlLength: html.length,
-    markers: found,
-    followers,
-    likeCountsFound: posts.likes.n,
-    commentCountsFound: posts.comments.n,
-    likeSample: posts.likes.first,
-    // Ye tukde sabse kaam ke hain: inhe padh kar pata chalega ki page
-    // me sach me kya aaya, kisi flag par bharosa nahi karna padega
-    peekFollower: peek(html, 'follower_count') || peek(html, 'edge_followed_by'),
-    peekRoute: peek(html, 'LoggedOutDesktopWWWProfileRoute', 40),
-    looksLikeShell: html.length < 600000 && !followers,
-    // engagement rate banane ke liye followers AUR kai posts ke likes, dono chahiye
-    usable: Boolean(followers) && posts.likes.n >= 3,
-  };
+  const text = await r.text();
+  return { status: r.status, length: text.length, ...verdictFor(text), peekF: peek(text, 'follower_count') };
 }
 
-// ---------------------------------------------------------------- handler
+async function tierWebApi(host, u, jar) {
+  const r = await fetch(
+    `https://${host}/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
+    {
+      signal: AbortSignal.timeout(T),
+      headers: browserHeaders({
+        Accept: '*/*',
+        'x-ig-app-id': IG_APP_ID,
+        'x-asbd-id': ASBD_ID,
+        'x-ig-www-claim': '0',
+        'x-requested-with': 'XMLHttpRequest',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        Referer: `https://www.instagram.com/${u}/`,
+        ...(jar?.csrftoken ? { 'x-csrftoken': jar.csrftoken } : {}),
+        ...(jar ? { Cookie: cookieStr(jar) } : {}),
+      }),
+    }
+  );
+  const text = await r.text();
+  let igMessage = null;
+  try { igMessage = JSON.parse(text).message || null; } catch {}
+  return { status: r.status, length: text.length, igMessage, ...verdictFor(text), peekF: peek(text, 'follower_count') };
+}
+
+async function tierGraphql(u, jar, docId) {
+  const body = new URLSearchParams({
+    doc_id: docId,
+    variables: JSON.stringify({ username: u, is_prefetch: false, render_surface: 'PROFILE' }),
+    server_timestamps: 'true',
+  });
+  const r = await fetch('https://www.instagram.com/api/graphql', {
+    method: 'POST',
+    signal: AbortSignal.timeout(T),
+    headers: browserHeaders({
+      Accept: '*/*',
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'x-ig-app-id': IG_APP_ID,
+      'x-asbd-id': ASBD_ID,
+      'x-fb-friendly-name': 'PolarisProfilePageContentQuery',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-origin',
+      Origin: 'https://www.instagram.com',
+      Referer: `https://www.instagram.com/${u}/`,
+      ...(jar?.csrftoken ? { 'x-csrftoken': jar.csrftoken } : {}),
+      ...(jar ? { Cookie: cookieStr(jar) } : {}),
+    }),
+    body,
+  });
+  const text = await r.text();
+  return { status: r.status, length: text.length, ...verdictFor(text), sample: text.slice(0, 220) };
+}
+
+/* ---------------------------------------------------------- handler */
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
@@ -161,54 +210,42 @@ export default async function handler(req, res) {
   if (!/^[A-Za-z0-9._]{1,30}$/.test(u)) {
     return res.status(400).json({ error: 'Pass a username, for example /api/profile-test?u=natgeo' });
   }
+  const docId = String(req.query.doc_id || '').replace(/\D/g, '');
 
   const startedAt = Date.now();
   const attempts = [];
-  let jar = null;
 
-  // --- A: bilkul cookie ke bina (v1 me yahi tha)
-  try {
-    attempts.push({ tier: 'page-nocookie', ...(await fetchProfilePage(u, null)) });
-  } catch (e) {
-    attempts.push({ tier: 'page-nocookie', error: `${e.name}: ${e.message}` });
-  }
+  const jar = await bigJar();
+  const jarKeys = Object.keys(jar);
+  const sessionJar = SESSIONID ? { ...jar, sessionid: SESSIONID } : null;
 
-  // --- B: guest cookies ke saath. Browser ke paas hamesha ye hote hain,
-  //        aur v1 ne ye combination try hi nahi kiya tha.
-  try {
-    jar = await guestJar();
-    attempts.push({
-      tier: 'page-guestcookies',
-      cookies: Object.keys(jar),
-      ...(await fetchProfilePage(u, cookieStr(jar))),
-    });
-  } catch (e) {
-    attempts.push({ tier: 'page-guestcookies', error: `${e.name}: ${e.message}` });
-  }
+  const run = async (tier, fn) => {
+    try { attempts.push({ tier, ...(await fn()) }); }
+    catch (e) { attempts.push({ tier, error: `${e.name}: ${e.message}` }); }
+  };
 
-  // --- C: sessionid ke saath, agar set ho
-  if (SESSIONID) {
-    try {
-      const c = { ...(jar || {}), sessionid: SESSIONID };
-      attempts.push({ tier: 'page-session', ...(await fetchProfilePage(u, cookieStr(c))) });
-    } catch (e) {
-      attempts.push({ tier: 'page-session', error: `${e.name}: ${e.message}` });
-    }
-  }
+  await run('A page+cookies', () => tierPage(u, jar));
+  await run('B page ?__a=1', () => tierPage(u, jar, '?__a=1&__d=dis'));
+  await run('C webapi www', () => tierWebApi('www.instagram.com', u, jar));
+  await run('D webapi i.', () => tierWebApi('i.instagram.com', u, jar));
+  if (docId) await run('E graphql', () => tierGraphql(u, jar, docId));
+  if (sessionJar) await run('F page+session', () => tierPage(u, sessionJar));
 
   const winner = attempts.find((a) => a.usable) || null;
-  const anyFollowers = attempts.find((a) => a.followers) || null;
+  const partial = attempts.find((a) => a.followers) || null;
 
   return res.status(200).json({
     verdict: winner
       ? `BUILDABLE via ${winner.tier}`
-      : anyFollowers
-        ? `PARTIAL: followers found via ${anyFollowers.tier}, but post counts are missing`
-        : 'NOT BUILDABLE from this server right now',
+      : partial
+        ? `PARTIAL: followers found via ${partial.tier}, post counts missing`
+        : 'no tier returned profile data',
     workingTier: winner ? winner.tier : null,
-    followers: anyFollowers ? anyFollowers.followers : null,
+    // Ye line dekhna: v2 me sirf csrftoken aur mid the. Ab datr aur
+    // ig_did bhi aaye ya nahi, wo yahan pata chalega.
+    cookiesCollected: jarKeys,
+    docIdUsed: docId || null,
     username: u,
-    hadSessionId: Boolean(SESSIONID),
     tookMs: Date.now() - startedAt,
     attempts,
   });
