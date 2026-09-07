@@ -1,251 +1,220 @@
 // ============================================================
-//  PROBE v4  —  api/profile-test.js
+//  PROBE v5  —  MOBILE API SURFACE
 //
-//  v2 ne jaldi haar maan li thi. Uski do kamiyan thin:
+//  v1 se v4 tak meri galti ek hi thi: maine chaar baar WEB surface
+//  test kiya. Vercel ka web page, Vercel ka web API, Cloudflare ka
+//  web page. Sab ek hi darwaza.
 //
-//  1. Cookie bootstrap kamzor tha. Usne sirf csrftoken aur mid
-//     uthaayi. Browser ke paas `datr` aur `ig_did` BHI hote hain,
-//     aur wahi Instagram ke device identity cookies hain jinka
-//     logged-out gating me sabse bada role hota hai.
+//  reel.js me ek DOOSRA surface hai jo Vercel se KAAM KARTA HAI:
 //
-//  2. Usne sirf profile page HTML try kiya. Browser ke DevTools me
-//     saaf dikhta hai ki data GraphQL aur doosre endpoints se bhi
-//     aata hai. Wo raaste chhue hi nahi gaye.
+//      i.instagram.com/api/v1/media/{id}/info/
+//      User-Agent: Instagram Android app
+//      X-IG-Capabilities: 3brTvw==
 //
-//  Ek baat jo yaad rakhni hai: POST page Vercel se theek chalta hai.
-//  Agar Instagram is IP ko bot maanta, to wo bhi fail hota. Yani
-//  masla poore IP ka nahi, sirf is ek route ki policy ka hai.
+//  Ye Android app ka API hai. Mere profile probes ne i.instagram.com
+//  par bhi WEB ka User-Agent bheja, jo turant pakda jaata hai.
 //
-//  Paanch raaste, poore browser jaise headers ke saath:
-//    A  profile page   (poori cookies)
-//    B  ?__a=1&__d=dis (purana JSON variant)
-//    C  web_profile_info  www.instagram.com par
-//    D  web_profile_info  i.instagram.com par (alag host)
-//    E  GraphQL POST      (doc_id tum DevTools se doge)
+//  Us surface par profile ke apne endpoints hain:
+//      /users/{username}/usernameinfo/    follower_count
+//      /users/{pk}/info/                  wahi, numeric id se
+//      /feed/user/{pk}/?count=12          recent posts, likes+comments
 //
-//  Chalao : /api/profile-test?u=natgeo
-//  GraphQL bhi try karne ke liye:
-//           /api/profile-test?u=natgeo&doc_id=<DevTools wala number>
+//  Aur pk hume POST se mil sakta hai, aur post fetch pehle se chalta
+//  hai. Yani chain ka pehla kadam already proven hai.
+//
+//  Chalao:
+//    /api/profile-test?u=natgeo
+//    /api/profile-test?u=natgeo&post=https://www.instagram.com/reel/XXXX/
+//
+//  Doosra wala zyada taakatwar hai: wo post se pk nikaal kar feed
+//  endpoint tak pahunchta hai, bina username lookup par bharosa kiye.
 // ============================================================
 
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const IG_APP_ID = '936619743392459';
-const ASBD_ID = '129477';
+
+// Wahi UA jo reel.js ka chalta hua mobile tier use karta hai
+const UA_MOBILE =
+  'Instagram 302.0.0.23.114 Android (33/13; 420dpi; 1080x2400; ' +
+  'samsung; SM-G991B; o1s; exynos2100; en_US; 526face9)';
+
 const SESSIONID = process.env.IG_SESSIONID || '';
 const T = 8000;
 
-/* Browser jo bhejta hai, lagbhag wahi. v2 me client hints adhoore the. */
-function browserHeaders(extra = {}) {
-  return {
-    'User-Agent': UA,
-    'Accept-Language': 'en-US,en;q=0.9',
-    'sec-ch-ua': '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-ch-ua-platform-version': '"15.0.0"',
-    'sec-ch-ua-full-version-list':
-      '"Chromium";v="131.0.6778.86", "Not_A Brand";v="24.0.0.0", "Google Chrome";v="131.0.6778.86"',
-    ...extra,
+/** reel.js ke chalte hue tier jaise hi headers */
+function mobileHeaders() {
+  const h = {
+    'User-Agent': UA_MOBILE,
+    'X-IG-App-ID': IG_APP_ID,
+    'X-IG-Capabilities': '3brTvw==',
+    'X-IG-Connection-Type': 'WIFI',
+    'Accept-Language': 'en-US',
+    Accept: '*/*',
   };
+  if (SESSIONID) h.Cookie = `sessionid=${SESSIONID}`;
+  return h;
 }
 
-/* ---- follower count har shape se ---- */
-const FOLLOWER_RE = [
-  ['follower_count', /"follower_count"\s*:\s*(\d+)/],
-  ['edge_followed_by', /"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)/],
-  ['followers_count', /"followers_count"\s*:\s*(\d+)/],
-];
-function grabFollowers(text) {
-  for (const [name, re] of FOLLOWER_RE) {
-    const m = text.match(re);
-    if (m) return { field: name, value: Number(m[1]) };
+function shortcodeToMediaId(shortcode) {
+  let id = 0n;
+  for (const ch of shortcode.slice(0, 11)) {
+    const i = ALPHABET.indexOf(ch);
+    if (i === -1) throw new Error('bad shortcode');
+    id = id * 64n + BigInt(i);
+  }
+  return id.toString();
+}
+function shortcodeOf(input) {
+  const s = String(input || '').trim();
+  if (/^[A-Za-z0-9_-]{5,30}$/.test(s) && !s.includes('/')) return s;
+  const m = s.match(/instagram\.com\/(?:[A-Za-z0-9._]+\/)?(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
+  return m ? m[1] : null;
+}
+
+async function getJson(url) {
+  const r = await fetch(url, { headers: mobileHeaders(), signal: AbortSignal.timeout(T) });
+  const text = await r.text();
+  let json = null, parseErr = null;
+  try { json = JSON.parse(text); } catch (e) { parseErr = 'not JSON'; }
+  return { status: r.status, length: text.length, json, parseErr, sample: text.slice(0, 220) };
+}
+
+/** Kisi bhi gehraai me follower count dhoondho */
+function findFollowers(o, d = 0) {
+  if (!o || typeof o !== 'object' || d > 8) return null;
+  if (typeof o.follower_count === 'number') return o.follower_count;
+  for (const k of Object.keys(o)) {
+    const v = findFollowers(o[k], d + 1);
+    if (v != null) return v;
   }
   return null;
 }
-function countMatches(text, re) {
-  const all = text.match(new RegExp(re.source, 'g'));
-  return all ? all.length : 0;
+function findPk(o, d = 0) {
+  if (!o || typeof o !== 'object' || d > 8) return null;
+  if (o.username && (o.pk != null || o.pk_id != null)) return String(o.pk ?? o.pk_id);
+  for (const k of Object.keys(o)) {
+    const v = findPk(o[k], d + 1);
+    if (v) return v;
+  }
+  return null;
 }
-function grabPosts(text) {
-  return {
-    likes: Math.max(
-      countMatches(text, /"like_count"\s*:\s*\d+/),
-      countMatches(text, /"edge_liked_by"\s*:\s*\{\s*"count"/)
-    ),
-    comments: Math.max(
-      countMatches(text, /"comment_count"\s*:\s*\d+/),
-      countMatches(text, /"edge_media_to_comment"\s*:\s*\{\s*"count"/)
-    ),
-  };
-}
-function peek(text, needle, pad = 110) {
-  const i = text.indexOf(needle);
-  if (i === -1) return null;
-  return text.slice(Math.max(0, i - 25), Math.min(text.length, i + needle.length + pad));
-}
-function verdictFor(text) {
-  const f = grabFollowers(text);
-  const p = grabPosts(text);
-  return { followers: f, posts: p, usable: Boolean(f) && p.likes >= 3 };
+/** feed response se posts nikaalo — yahi engagement rate ki jaan hai */
+function itemsOf(json) {
+  const arr = json?.items || json?.feed_items || [];
+  return arr.map((x) => {
+    const n = x.media_or_ad || x.media || x;
+    return {
+      code: n.code || null,
+      likes: n.like_count ?? null,
+      comments: n.comment_count ?? null,
+      plays: n.play_count ?? n.view_count ?? null,
+      takenAt: n.taken_at ?? null,
+      isVideo: n.media_type === 2,
+    };
+  }).filter((p) => p.likes != null || p.comments != null);
 }
 
-/* ---------------------------------------------------------- cookies
-   v2 ne sirf ek homepage GET kiya tha aur do cookies mili thin.
-   Browser ko `datr` aur `ig_did` bhi milte hain, isliye do jagah se
-   uthate hain aur jo mile sab jodte hain. */
-async function bigJar() {
-  const jar = {};
-  const grab = async (url) => {
-    try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(T), headers: browserHeaders({
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none',
-      }) });
-      for (const c of r.headers.getSetCookie?.() || []) {
-        const [pair] = c.split(';');
-        const i = pair.indexOf('=');
-        if (i > 0) jar[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
-      }
-      // kabhi kabhi ig_did sirf HTML ke andar milta hai
-      const html = await r.text();
-      if (!jar.ig_did) {
-        const m = html.match(/"device_id"\s*:\s*"([A-F0-9-]{36})"/i);
-        if (m) jar.ig_did = m[1];
-      }
-      if (!jar.csrftoken) {
-        const m = html.match(/"csrf_token"\s*:\s*"([^"]+)"/);
-        if (m) jar.csrftoken = m[1];
-      }
-    } catch { /* ek jagah fail ho to doosri se chal jayega */ }
-  };
-  await grab('https://www.instagram.com/');
-  if (!jar.datr || !jar.ig_did) await grab('https://www.instagram.com/accounts/login/');
-  return jar;
-}
-const cookieStr = (jar) => Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
-
-/* ---------------------------------------------------------- tiers */
-async function tierPage(u, jar, qs = '') {
-  const r = await fetch(`https://www.instagram.com/${encodeURIComponent(u)}/${qs}`, {
-    signal: AbortSignal.timeout(T),
-    redirect: 'follow',
-    headers: browserHeaders({
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Upgrade-Insecure-Requests': '1',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'none',
-      'sec-fetch-user': '?1',
-      ...(jar ? { Cookie: cookieStr(jar) } : {}),
-    }),
-  });
-  const text = await r.text();
-  return { status: r.status, length: text.length, ...verdictFor(text), peekF: peek(text, 'follower_count') };
-}
-
-async function tierWebApi(host, u, jar) {
-  const r = await fetch(
-    `https://${host}/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`,
-    {
-      signal: AbortSignal.timeout(T),
-      headers: browserHeaders({
-        Accept: '*/*',
-        'x-ig-app-id': IG_APP_ID,
-        'x-asbd-id': ASBD_ID,
-        'x-ig-www-claim': '0',
-        'x-requested-with': 'XMLHttpRequest',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        Referer: `https://www.instagram.com/${u}/`,
-        ...(jar?.csrftoken ? { 'x-csrftoken': jar.csrftoken } : {}),
-        ...(jar ? { Cookie: cookieStr(jar) } : {}),
-      }),
-    }
-  );
-  const text = await r.text();
-  let igMessage = null;
-  try { igMessage = JSON.parse(text).message || null; } catch {}
-  return { status: r.status, length: text.length, igMessage, ...verdictFor(text), peekF: peek(text, 'follower_count') };
-}
-
-async function tierGraphql(u, jar, docId) {
-  const body = new URLSearchParams({
-    doc_id: docId,
-    variables: JSON.stringify({ username: u, is_prefetch: false, render_surface: 'PROFILE' }),
-    server_timestamps: 'true',
-  });
-  const r = await fetch('https://www.instagram.com/api/graphql', {
-    method: 'POST',
-    signal: AbortSignal.timeout(T),
-    headers: browserHeaders({
-      Accept: '*/*',
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'x-ig-app-id': IG_APP_ID,
-      'x-asbd-id': ASBD_ID,
-      'x-fb-friendly-name': 'PolarisProfilePageContentQuery',
-      'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors',
-      'sec-fetch-site': 'same-origin',
-      Origin: 'https://www.instagram.com',
-      Referer: `https://www.instagram.com/${u}/`,
-      ...(jar?.csrftoken ? { 'x-csrftoken': jar.csrftoken } : {}),
-      ...(jar ? { Cookie: cookieStr(jar) } : {}),
-    }),
-    body,
-  });
-  const text = await r.text();
-  return { status: r.status, length: text.length, ...verdictFor(text), sample: text.slice(0, 220) };
-}
-
-/* ---------------------------------------------------------- handler */
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-store');
 
-  const u = String(req.query.u || req.query.username || '').trim().replace(/^@/, '');
-  if (!/^[A-Za-z0-9._]{1,30}$/.test(u)) {
-    return res.status(400).json({ error: 'Pass a username, for example /api/profile-test?u=natgeo' });
+  const u = String(req.query.u || '').trim().replace(/^@/, '');
+  const postCode = shortcodeOf(req.query.post);
+  if (!u && !postCode) {
+    return res.status(400).json({ error: 'Pass ?u=natgeo and optionally &post=<a reel link>' });
   }
-  const docId = String(req.query.doc_id || '').replace(/\D/g, '');
 
   const startedAt = Date.now();
   const attempts = [];
+  let pk = null, followers = null, posts = [];
 
-  const jar = await bigJar();
-  const jarKeys = Object.keys(jar);
-  const sessionJar = SESSIONID ? { ...jar, sessionid: SESSIONID } : null;
-
-  const run = async (tier, fn) => {
+  const push = async (tier, fn) => {
     try { attempts.push({ tier, ...(await fn()) }); }
     catch (e) { attempts.push({ tier, error: `${e.name}: ${e.message}` }); }
   };
 
-  await run('A page+cookies', () => tierPage(u, jar));
-  await run('B page ?__a=1', () => tierPage(u, jar, '?__a=1&__d=dis'));
-  await run('C webapi www', () => tierWebApi('www.instagram.com', u, jar));
-  await run('D webapi i.', () => tierWebApi('i.instagram.com', u, jar));
-  if (docId) await run('E graphql', () => tierGraphql(u, jar, docId));
-  if (sessionJar) await run('F page+session', () => tierPage(u, sessionJar));
+  // --- A: username se seedha profile info (Android app ka apna endpoint)
+  if (u) {
+    await push('A usernameinfo', async () => {
+      const r = await getJson(`https://i.instagram.com/api/v1/users/${encodeURIComponent(u)}/usernameinfo/`);
+      const f = findFollowers(r.json), p = findPk(r.json);
+      if (f != null) followers = f;
+      if (p) pk = p;
+      return { status: r.status, length: r.length, followers: f, pk: p, sample: r.sample };
+    });
+  }
 
-  const winner = attempts.find((a) => a.usable) || null;
-  const partial = attempts.find((a) => a.followers) || null;
+  // --- B: wahi cheez web_profile_info se, par MOBILE UA ke saath
+  if (u && followers == null) {
+    await push('B web_profile_info + mobile UA', async () => {
+      const r = await getJson(`https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(u)}`);
+      const f = findFollowers(r.json), p = findPk(r.json);
+      if (f != null) followers = f;
+      if (p) pk = p;
+      return { status: r.status, length: r.length, followers: f, pk: p, sample: r.sample };
+    });
+  }
+
+  // --- C: post se pk nikaalo. YE RASTA PEHLE SE CHALTA HAI.
+  //        reel.js ka mobile tier bilkul yahi call karta hai.
+  if (postCode && !pk) {
+    await push('C pk from post', async () => {
+      const mediaId = shortcodeToMediaId(postCode);
+      const r = await getJson(`https://i.instagram.com/api/v1/media/${mediaId}/info/`);
+      const p = findPk(r.json), f = findFollowers(r.json);
+      if (p) pk = p;
+      if (f != null && followers == null) followers = f;
+      return {
+        status: r.status, length: r.length, pk: p, followers: f,
+        // Post ke apne numbers bhi dekh lete hain
+        postLikes: r.json?.items?.[0]?.like_count ?? null,
+        postComments: r.json?.items?.[0]?.comment_count ?? null,
+        sample: r.sample,
+      };
+    });
+  }
+
+  // --- D: pk mil gaya to profile info
+  if (pk && followers == null) {
+    await push('D users/{pk}/info', async () => {
+      const r = await getJson(`https://i.instagram.com/api/v1/users/${pk}/info/`);
+      const f = findFollowers(r.json);
+      if (f != null) followers = f;
+      return { status: r.status, length: r.length, followers: f, sample: r.sample };
+    });
+  }
+
+  // --- E: SABSE ZAROORI. pk se recent posts, likes aur comments ke saath.
+  //        Engagement rate ke liye yahi chahiye.
+  if (pk) {
+    await push('E feed/user/{pk}', async () => {
+      const r = await getJson(`https://i.instagram.com/api/v1/feed/user/${pk}/?count=12`);
+      const list = itemsOf(r.json);
+      if (list.length) posts = list;
+      return {
+        status: r.status, length: r.length,
+        postsReturned: list.length,
+        firstThree: list.slice(0, 3),
+        sample: list.length ? null : r.sample,
+      };
+    });
+  }
+
+  const haveEnough = followers != null && posts.length >= 3;
 
   return res.status(200).json({
-    verdict: winner
-      ? `BUILDABLE via ${winner.tier}`
-      : partial
-        ? `PARTIAL: followers found via ${partial.tier}, post counts missing`
-        : 'no tier returned profile data',
-    workingTier: winner ? winner.tier : null,
-    // Ye line dekhna: v2 me sirf csrftoken aur mid the. Ab datr aur
-    // ig_did bhi aaye ya nahi, wo yahan pata chalega.
-    cookiesCollected: jarKeys,
-    docIdUsed: docId || null,
-    username: u,
+    verdict: haveEnough
+      ? 'BUILDABLE — followers and post counts both came through on the mobile API'
+      : followers != null
+        ? 'PARTIAL — followers came through but the post feed did not'
+        : posts.length
+          ? 'PARTIAL — post feed came through but follower count did not'
+          : 'mobile API gave nothing either',
+    followers,
+    pk,
+    postsFound: posts.length,
+    hadSessionId: Boolean(SESSIONID),
+    username: u || null,
     tookMs: Date.now() - startedAt,
     attempts,
   });
