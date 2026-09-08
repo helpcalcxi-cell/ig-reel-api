@@ -94,6 +94,73 @@ const UA_MOBILE =
 // Iske bina bhi try hoga, par iske saath success rate bahut zyada hai.
 const SESSIONID = process.env.IG_SESSIONID || '';
 
+// ============================================================
+//  v10 — RESIDENTIAL PROXY + SELF-HEALING SESSION  (opt-in)
+//
+//  Ye teeno feature DEFAULT PAR BAND hain. Purana bartaav bilkul waisa ka waisa
+//  rehta hai jab tak aap env var se on na karo. Isliye rollout aasan hai: pehle
+//  test me on karke dekho, phir production me.
+//
+//  Kyun banaya: igexport aur fastvideosave (videodropper.app) dono
+//  age-restricted reels laa lete hain. Dono ke CDN link me `urlgen_source:"www"`
+//  likha hai — yaani logged-in session se WEB darwaze par fetch. Farak sirf
+//  itna hai ki wo residential proxy ke peeche session chalate hain, isliye
+//  Instagram unhe datacenter bot nahi samajhta aur account jaldi nahi marta.
+//
+//  Aayush ne khud session try ki thi par account kuch der me logout/block ho
+//  jaata tha — kyunki Vercel/Cloudflare ka datacenter IP. Iska ilaaj:
+//    1. IG_PROXY_URL  — saari Instagram request residential proxy se bhejo.
+//    2. IG_SESSION_SELF_HEAL — session marte hi use band karke aage anonymous
+//       chalo, taki dead session 502 ka toofan na banaye (Sept wala incident).
+//    3. IG_TRY_AGE_WITH_SESSION — session ho to age-gate par bhi session tier
+//       try karo (anonymous ke liye age-gate abhi bhi turant 404).
+// ============================================================
+
+// http://user:pass@host:port  — residential proxy. Khaali = koi proxy nahi.
+const IG_PROXY_URL = process.env.IG_PROXY_URL || '';
+// Feature flags CALL-TIME par padhe jaate hain (module load par nahi), taki
+// test me ek hi instance par alag-alag flag aazmaye ja sakein.
+const selfHealOn = () => process.env.IG_SESSION_SELF_HEAL === '1';
+const tryAgeWithSession = () => process.env.IG_TRY_AGE_WITH_SESSION === '1';
+
+// Proxy ek hi baar set hota hai (undici ka global dispatcher). undici Node me
+// hai par public import nahi — isliye dynamic import, aur na mile to graceful
+// disable (proxy off, baaki sab chalta rahe). `null`=abhi try nahi kiya,
+// `true`=on, `false`=try kiya par nahi laga.
+let _proxyInit = null;
+function initProxy() {
+  if (!IG_PROXY_URL) return Promise.resolve('off');
+  if (_proxyInit) return _proxyInit;
+  _proxyInit = (async () => {
+    try {
+      const { ProxyAgent, setGlobalDispatcher } = await import('undici');
+      setGlobalDispatcher(new ProxyAgent(IG_PROXY_URL));
+      return 'on';
+    } catch (e) {
+      // undici install nahi hai ya URL galat — proxy ke bina hi chalo.
+      console.warn('[proxy] IG_PROXY_URL diya gaya par proxy set nahi hua:', e?.message);
+      return 'unavailable';
+    }
+  })();
+  return _proxyInit;
+}
+
+// SELF-HEAL: ek baar session marti dikhi (logout_reason), to is instance ki
+// baaki zindagi ke liye session bhejna band. `currentSessionId()` isi ko
+// maanta hai — cookieHeader aur mobile-api dono yahi se session lete hain.
+let sessionDisabled = false;
+function currentSessionId() {
+  return sessionDisabled ? '' : SESSIONID;
+}
+// Effective session: config me hai AUR abhi disable nahi hui.
+function usingSession() {
+  return Boolean(currentSessionId());
+}
+// Kisi tier ke jawab me "session mar gayi" ka pakka ishaara?
+function looksLoggedOut(diag) {
+  return /logout_reason|You.{0,3}ve Been Logged Out/i.test(JSON.stringify(diag || {}));
+}
+
 // Vercel Hobby ka function 10 second me kat jaata hai. Ek atki hui request
 // poora budget kha leti hai aur baaki tier chalte hi nahi — isliye har fetch
 // ki apni seema. 4 tier x 6s worst case bhi budget ke andar hai kyunki pehla
@@ -171,8 +238,17 @@ const POST_LIKELY_CODES = new Set(['NEED_LOGIN', 'SESSION_REJECTED', 'APP_SHELL'
 // ⚠️ Ye check SIRF failure ke raste par chalta hai. Normal page ke JSON me
 //    `"is_age_restricted":false` aata hai, aur agar ise success par bhi
 //    chalate to wo false positive de sakta tha.
+//
+// v9.8 — DctvogjBA_F par pakda gaya: browser me "People under 18 can't see this
+// content" dikhta hai, par wo text CLIENT-side render hota hai. Server ko sirf
+// ek 621 KB ka khaali shell milta hai — bilkul flagged-IP shell jaisa — isliye
+// pehla AGE_GATE_RE ise pehchan nahi paata tha aur reel NEED_LOGIN/404 ban jaati
+// thi (4.9s + control probe ke baad). Par us shell ke andar ek pakka nishaan
+// chhupa hota hai: `"failure_reason":"MA","restricted_age":18`. MA = Mature
+// Audience. Control post me ye kabhi nahi aata. Isse ab wahi ~1 fetch, saaf
+// AGE_RESTRICTED jawab.
 const AGE_GATE_RE =
-  /Age-restricted content|restricted based on your age|"is_age_restricted"\s*:\s*true|age_restricted_content/i;
+  /Age-restricted content|restricted based on your age|"is_age_restricted"\s*:\s*true|age_restricted_content|"failure_reason"\s*:\s*"MA"|"restricted_age"\s*:\s*[1-9]\d/i;
 
 // Kuch halaat me hum pakke taur par jaante hain ki hua kya — un par user ko
 // gol-mol jawab dena bekaar hai. Baaki sab aam jawab par girte hain.
@@ -380,9 +456,10 @@ function dsUserIdFromSession(sid) {
 
 function cookieHeader(jar) {
   const all = { ...jar };
-  if (SESSIONID) {
-    all.sessionid = SESSIONID;
-    const ds = dsUserIdFromSession(SESSIONID);
+  const sid = currentSessionId(); // self-heal ke baad khaali ho sakti hai
+  if (sid) {
+    all.sessionid = sid;
+    const ds = dsUserIdFromSession(sid);
     if (ds) all.ds_user_id = ds;
   }
   return Object.entries(all)
@@ -831,9 +908,10 @@ async function fromMobileApi(shortcode, jar) {
     'Accept-Language': 'en-US',
     Accept: '*/*',
   };
-  if (SESSIONID) {
-    const ds = dsUserIdFromSession(SESSIONID);
-    headers.Cookie = `sessionid=${SESSIONID}` + (ds ? `; ds_user_id=${ds}` : '');
+  const sid = currentSessionId(); // self-heal ke baad khaali ho sakti hai
+  if (sid) {
+    const ds = dsUserIdFromSession(sid);
+    headers.Cookie = `sessionid=${sid}` + (ds ? `; ds_user_id=${ds}` : '');
     if (ds) headers['X-IG-Android-ID'] = `android-${ds.slice(0, 16)}`;
   }
 
@@ -1117,6 +1195,12 @@ function addDownloadLinks(data) {
     audio_download_url: on && data.audio_url
       ? via(data.audio_url, `name=${encodeURIComponent(user + '_' + code + '.m4a')}`)
       : data.audio_url || null,
+    // Inline audio link — <audio> me play ke liye. download_url par
+    // Content-Disposition:attachment lagta hai jise kuch browser subresource par
+    // bhi maan kar play ki jagah download shuru kar dete hain, isliye alag link.
+    audio_media_url: on && data.audio_url
+      ? via(data.audio_url, 'inline=1')
+      : data.audio_url || null,
     forced_download: on,
   };
 }
@@ -1164,6 +1248,10 @@ export default async function handler(req, res) {
   const shareToken = extractShareToken(req.query.url);
   const attempts = [];
 
+  // Proxy ek hi baar set hota hai (undici global dispatcher). IG_PROXY_URL
+  // khaali ho to 'off', undici na mile to 'unavailable' — dono me chalta rahega.
+  const proxyState = await initProxy();
+
   // --- Tier 0: reel page. Ise cookies chahiye hi NAHI, isliye sabse pehle
   //     chalta hai aur cookie bootstrap se PEHLE. Chal gaya to us 616 KB wale
   //     homepage ko chhuna hi nahi padta — na data lagta, na waqt.
@@ -1193,6 +1281,13 @@ export default async function handler(req, res) {
   // milega hi nahi. Us haal me session tier, cookie refresh, dobara koshish —
   // sab sirf waqt aur data kharch karte hain, nateeja wahi rehta hai.
   const ageGate = () => attempts.some((a) => a.ageRestricted);
+
+  // Age gate par jaldi bail karna chahiye (anonymous us deewar ko nahi kholta).
+  // PAR agar IG_TRY_AGE_WITH_SESSION on hai AUR humare paas zinda session hai,
+  // to session tier try karne do — igexport/videodropper bhi session se hi
+  // age-gated reel laate hain (`urlgen_source:"www"`). Session na ho / flag off
+  // ho to purana v9.7/9.8 bartaav: turant 404.
+  const stopForAge = () => ageGate() && !(tryAgeWithSession() && usingSession());
 
   if (!data && shareToken && !ageGate() && timeLeft() >= MIN_TIER_MS) {
     try {
@@ -1234,6 +1329,21 @@ export default async function handler(req, res) {
         const { sample, htmlLength, ...safeDiag } = diag;
         attempts.push({ tier: name, ok, ...(debug ? diag : safeDiag) });
         if (ok) return d;
+
+        // SELF-HEAL (opt-in): session marti dikhi (logout_reason) to use is
+        // instance ki baaki zindagi ke liye band karo aur tier DOBARA anonymous
+        // chalao. Ye Sept wale 502-toofan ka ilaaj hai: dead session har tier
+        // ko `login_required` se bhar deti thi -> SESSION_KILLED -> uncached 502.
+        // Session band karte hi wahi fail ab NEED_LOGIN ban jaata hai, jo health
+        // check ke baad cacheable 404 hota hai. Sirf ek baar heal hota hai.
+        if (selfHealOn() && usingSession() && !sessionDisabled && looksLoggedOut(diag)) {
+          sessionDisabled = true;
+          attempts.push({
+            tier: '(session healed)', ok: false,
+            reason: 'session looked dead (logout_reason) — disabling it for this instance and retrying tiers without it',
+          });
+          return await runTiers(); // ab bina session ke, sirf ek baar
+        }
       } catch (e) {
         // `TypeError: fetch failed` apne aap me kuch nahi batata — asli wajah
         // (connection reset, DNS, timeout) e.cause me hoti hai. Use bahar
@@ -1245,7 +1355,7 @@ export default async function handler(req, res) {
   };
 
   // reel-page gira — ab cookies lao aur baaki tier chalao
-  if (!data && !ageGate()) {
+  if (!data && !stopForAge()) {
     try {
       const c = await getJar();
       jar = c.jar;
@@ -1260,7 +1370,7 @@ export default async function handler(req, res) {
   // sakta hai. Isliye agar saare tier fail hue AUR jar cache se aaya tha, to
   // ek baar taaza cookie lekar dobara koshish karo. Ye sirf tab chalta hai jab
   // pehle hi sab fail ho chuka ho — normal request par extra kharcha zero.
-  if (!data && !ageGate() && cookieInfo?.cached && timeLeft() >= MIN_TIER_MS) {
+  if (!data && !stopForAge() && cookieInfo?.cached && timeLeft() >= MIN_TIER_MS) {
     attempts.push({ tier: '(cookie refresh)', ok: false, reason: 'all tiers failed, retrying once with fresh cookies' });
     try {
       const c2 = await getJar(true);
@@ -1280,6 +1390,7 @@ export default async function handler(req, res) {
       return res.status(200).json({
         ...addDownloadLinks(data), cookies: cookieInfo, attempts,
         tookMs: Date.now() - startedAt,
+        proxy: proxyState, sessionHealed: sessionDisabled,
       });
     }
     const ttl = cacheSeconds(data);
@@ -1288,7 +1399,10 @@ export default async function handler(req, res) {
     return res.status(200).json(addDownloadLinks(data));
   }
 
-  const verdict = diagnose(attempts, Boolean(SESSIONID));
+  // usingSession() — Boolean(SESSIONID) nahi. Self-heal ke baad session band ho
+  // chuki hai, to diagnose ko SESSION_KILLED nahi, NEED_LOGIN dena chahiye
+  // (jo cacheable 404 banata hai). Yahi is guard ka poora maqsad hai.
+  const verdict = diagnose(attempts, usingSession());
 
   // Status soch-samajh kar chuna gaya hai, kyunki Vercel sirf
   // 200/404/410/301/302/307/308 cache karta hai — 502 kabhi cache nahi hota.
@@ -1344,6 +1458,8 @@ export default async function handler(req, res) {
     tookMs: Date.now() - startedAt,
     docIdUsed: DOC_ID,
     hadSessionId: Boolean(SESSIONID),
+    sessionHealed: sessionDisabled,
+    proxy: proxyState,
     cookies: cookieInfo,
     attempts,
   });
