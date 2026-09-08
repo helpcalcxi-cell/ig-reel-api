@@ -5,5 +5,8 @@
   "private": true,
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "undici": "^8.10.2"
   }
 }
