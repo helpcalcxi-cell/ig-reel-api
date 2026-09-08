@@ -1259,14 +1259,33 @@ export default async function handler(req, res) {
   let cookieInfo = null;
   let jar = {};
 
-  try {
-    const r = await fromReelPage(shortcode);
-    const { ok, data: d, ...diag } = r;
-    const { sample, htmlLength, ...safeDiag } = diag;
-    attempts.push({ tier: 'reel-page', ok, ...(debug ? diag : safeDiag) });
-    if (ok) data = d;
-  } catch (e) {
-    attempts.push({ tier: 'reel-page', ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
+  // v11 — RETRY-ON-SHELL (rotating proxy ke liye).
+  // Rotating residential proxy par har request naya exit IP leti hai. Kuch exit
+  // IP Instagram ne flag kiye hote hain — unse reel-page ko khaali "app shell"
+  // milta hai (media nahi). Ek flake se pehle poora fail ho kar 404 CDN par 10
+  // min cache ho jaata tha, aur us window me sabko "could not be fetched" dikhta.
+  // Ab: shell mile to reel-page ko turant DOBARA try karo — nayi request = naya
+  // IP, jo aksar theek hota hai. Sirf jab proxy sach me 'on' ho, aur sirf shell
+  // par (age-gate ya genuine 404 par nahi — wahan retry bekaar hai).
+  const REELPAGE_TRIES = proxyState === 'on'
+    ? Math.max(1, (Number(process.env.IG_REELPAGE_RETRIES) || 2) + 1)
+    : 1;
+  for (let attempt = 1; attempt <= REELPAGE_TRIES && !data; attempt++) {
+    if (attempt > 1 && timeLeft() < MIN_TIER_MS) break;
+    const label = attempt === 1 ? 'reel-page' : `reel-page#${attempt}`;
+    try {
+      const r = await fromReelPage(shortcode);
+      const { ok, data: d, ...diag } = r;
+      const { sample, htmlLength, ...safeDiag } = diag;
+      attempts.push({ tier: label, ok, ...(debug ? diag : safeDiag) });
+      if (ok) { data = d; break; }
+      // Sirf flagged-IP shell par dobara — warna (age gate / 404 / parse-fail) rok do.
+      if (!(r.isAppShell && !r.ageRestricted)) break;
+    } catch (e) {
+      attempts.push({ tier: label, ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
+      // network/proxy hiccup par bhi ek aur mauka — par tries khatam to ruk jao.
+      if (attempt >= REELPAGE_TRIES) break;
+    }
   }
 
   // Saaf URL gira aur user ke link me share token tha — ek baar token ke saath.
