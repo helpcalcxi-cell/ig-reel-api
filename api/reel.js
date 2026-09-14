@@ -191,7 +191,7 @@ const RECENT_SUCCESS_MS = 5 * 60 * 1000;
 
 // v12 — kaunsa build live hai, ye debug/failure response me dikhta hai. Deploy
 // verify karne ke liye (bahar se v10/v11/v12 ka farak warna dikhta nahi tha).
-const BUILD = 'v12';
+const BUILD = 'v13';
 
 // v12 — UNCERTAIN 404 ka chhota cache.
 // Confident 404 (AGE_RESTRICTED / REEL_NOT_FOUND, verdict se) 10 min cache safe
@@ -1291,8 +1291,11 @@ export default async function handler(req, res) {
       const { sample, htmlLength, ...safeDiag } = diag;
       attempts.push({ tier: label, ok, ...(debug ? diag : safeDiag) });
       if (ok) { data = d; break; }
-      // Sirf flagged-IP shell par dobara — warna (age gate / 404 / parse-fail) rok do.
-      if (!(r.isAppShell && !r.ageRestricted)) break;
+      // v13 — reel-page ka KOI BHI fail rotating proxy par flake ho sakta hai:
+      // bada app-shell, chhota logged-out shell, parse-hiccup, truncated page —
+      // sab. Isliye age gate ke ALAWA har fail par naye IP se dobara try karo.
+      // (Age gate asli deewar hai, wahan naya IP bhi kaam nahi karega.)
+      if (r.ageRestricted) break;
     } catch (e) {
       attempts.push({ tier: label, ok: false, reason: `${e.name}: ${e.message}`, cause: causeOf(e) });
       // network/proxy hiccup par bhi ek aur mauka — par tries khatam to ruk jao.
