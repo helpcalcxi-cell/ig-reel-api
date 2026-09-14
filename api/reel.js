@@ -189,6 +189,18 @@ const MIN_TIER_MS = 1500;
 let lastSuccessAt = 0;
 const RECENT_SUCCESS_MS = 5 * 60 * 1000;
 
+// v12 — kaunsa build live hai, ye debug/failure response me dikhta hai. Deploy
+// verify karne ke liye (bahar se v10/v11/v12 ka farak warna dikhta nahi tha).
+const BUILD = 'v12';
+
+// v12 — UNCERTAIN 404 ka chhota cache.
+// Confident 404 (AGE_RESTRICTED / REEL_NOT_FOUND, verdict se) 10 min cache safe
+// hai. Par jab 404 sirf control-probe/recent-success se aaya ho, to rotating
+// proxy par wo ek flagged exit IP ka FLAKE bhi ho sakta hai (normal reel). Use
+// 10 min cache karne se ek flake 10 min tak sabke liye reel tod deta tha. Isliye
+// proxy on hone par aise 404 ko sirf itni der cache karo.
+const UNCERTAIN_404_TTL = Number(process.env.IG_UNCERTAIN_404_TTL) || 60;
+
 // lastSuccessAt akela kaafi NAHI hai, aur wajah samajhna zaroori hai:
 // kaamyaab jawab CDN par cache hote hain (s-maxage), isliye woh dobara
 // function tak pahunchte hi nahi. Vercel kai instance chalata hai, to ek
@@ -1409,7 +1421,7 @@ export default async function handler(req, res) {
       return res.status(200).json({
         ...addDownloadLinks(data), cookies: cookieInfo, attempts,
         tookMs: Date.now() - startedAt,
-        proxy: proxyState, sessionHealed: sessionDisabled,
+        proxy: proxyState, sessionHealed: sessionDisabled, build: BUILD,
       });
     }
     const ttl = cacheSeconds(data);
@@ -1458,7 +1470,13 @@ export default async function handler(req, res) {
   if (debug) {
     res.setHeader('Cache-Control', 'no-store');
   } else if (reelFault) {
-    res.setHeader('Cache-Control', 'public, s-maxage=600, max-age=0');
+    // verdict.reelFault = pakka reel ki galti (age/deleted) -> 10 min safe.
+    // warna ye health-check se laga 404 hai (uncertain). Rotating proxy par
+    // reel-page aur control-probe alag exit IP se jaate hain, to ek flagged IP
+    // ka flake yahan galat 404 bana sakta hai. Isliye proxy on ho to sirf thodi
+    // der cache, warna normal reel ka transient 404 sabke liye 10 min chipak jaata.
+    const ttl = verdict.reelFault ? 600 : (proxyState === 'on' ? UNCERTAIN_404_TTL : 600);
+    res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
   } else {
     res.setHeader('Cache-Control', 'no-store');
   }
@@ -1479,6 +1497,7 @@ export default async function handler(req, res) {
     hadSessionId: Boolean(SESSIONID),
     sessionHealed: sessionDisabled,
     proxy: proxyState,
+    build: BUILD,
     cookies: cookieInfo,
     attempts,
   });
