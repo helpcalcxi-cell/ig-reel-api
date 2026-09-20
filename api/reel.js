@@ -191,7 +191,7 @@ const RECENT_SUCCESS_MS = 5 * 60 * 1000;
 
 // v12 — kaunsa build live hai, ye debug/failure response me dikhta hai. Deploy
 // verify karne ke liye (bahar se v10/v11/v12 ka farak warna dikhta nahi tha).
-const BUILD = 'v13';
+const BUILD = 'v14';
 
 // v12 — UNCERTAIN 404 ka chhota cache.
 // Confident 404 (AGE_RESTRICTED / REEL_NOT_FOUND, verdict se) 10 min cache safe
@@ -1376,6 +1376,9 @@ export default async function handler(req, res) {
             tier: '(session healed)', ok: false,
             reason: 'session looked dead (logout_reason) — disabling it for this instance and retrying tiers without it',
           });
+          // v14 — saaf alarm: session mar gayi. Vercel logs me "SESSION_DEAD"
+          // search karke turant pata chalega ki nayi IG_SESSIONID chahiye.
+          console.warn(`SESSION_DEAD heal ${shortcode} tier=${name} — logout_reason seen; session disabled for this instance, retrying anonymously`);
           return await runTiers(); // ab bina session ke, sirf ek baar
         }
       } catch (e) {
@@ -1482,6 +1485,19 @@ export default async function handler(req, res) {
     res.setHeader('Cache-Control', `public, s-maxage=${ttl}, max-age=0`);
   } else {
     res.setHeader('Cache-Control', 'no-store');
+  }
+
+  // v14 — FAILURE-REASON LOGGING (open item #3). Har fail par ek greppable line,
+  // taaki Vercel logs me pata chale kaunsa karan haavi hai (age/private/session/
+  // rate-limit). Success CDN-cache hote hain isliye logs me nahi dikhte — ye
+  // sirf failures par chalta hai, noise kam.
+  const httpStatus = reelFault ? 404 : 502;
+  const blame = reelFault ? (verdict.reelFault ? 'verdict' : how) : 'our-side';
+  const sessState = SESSIONID ? (sessionDisabled ? 'healed' : 'on') : 'off';
+  console.log(`REEL_FAIL ${verdict.code} ${shortcode} ${httpStatus} ${Date.now() - startedAt}ms blamedOn=${blame} proxy=${proxyState} session=${sessState}`);
+  // Session mar gayi (self-heal off tha) — alag alarm taaki turant replace ho.
+  if (verdict.code === 'SESSION_KILLED' || verdict.code === 'SESSION_REJECTED') {
+    console.warn(`SESSION_DEAD ${verdict.code} ${shortcode} — replace IG_SESSIONID (account logged out / rejected)`);
   }
 
   return res.status( reelFault ? 404 : 502 ).json({
